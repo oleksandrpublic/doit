@@ -10,22 +10,22 @@ model = "qwen3.5:9b"
 # If a role is omitted, falls back to `model` above.
 #
 # Routing logic:
-#   thinking  — первый вызов каждого шага (анализ + выбор инструмента)
+#   thinking  — first call of each step (analysis + tool selection)
 #   coding    — write_file, str_replace
 #   search    — read_file, list_dir, find_files, search_in_files
 #   execution — run_command
-#   vision    — read_image (требует vision-модель)
+#   vision    — read_image (requires a vision-capable model)
 #
-# ВАЖНО: qwen3.5 vision пока не работает в Ollama (ограничение mmproj).
-#        Для vision используй llama.cpp бэкенд.
+# NOTE: qwen3.5 vision does not yet work in Ollama (mmproj limitation).
+#       For vision tasks use the llama.cpp backend instead.
 #
 # [models]
 # thinking  = "qwen3.5:9b"
-# coding    = "qwen3-coder-next"        # локально ~52GB
-# coding    = "qwen3-coder-next:cloud"  # cloud-вариант
+# coding    = "qwen3-coder-next"        # local ~52GB
+# coding    = "qwen3-coder-next:cloud"  # cloud variant
 # search    = "qwen3.5:9b"
 # execution = "qwen3.5:9b"
-# vision    = "qwen3.5:9b"             # только через llama.cpp
+# vision    = "qwen3.5:9b"             # only via llama.cpp
 [models]
 
 # 0.0 = deterministic, higher = more creative

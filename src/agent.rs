@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn parse_action_prose_before_json() {
-        // Qwen и другие модели иногда добавляют текст перед JSON
+        // Qwen and other models sometimes prepend prose text before the JSON
         let raw = "Sure, here is my response:\n{\"thought\":\"x\",\"tool\":\"tree\",\"args\":{}}";
         let a = parse_action(raw).unwrap();
         assert_eq!(a.tool, "tree");

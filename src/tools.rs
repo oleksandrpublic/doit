@@ -2846,7 +2846,7 @@ mod tests {
 
     #[test]
     fn coverage_ignores_values_over_100() {
-        // "200% faster" не должно приниматься за coverage
+        // "200% faster" should not be mistaken for coverage
         let out = "200% faster startup\n72% coverage";
         assert_eq!(parse_coverage_percent(out), Some(72.0));
     }
@@ -3021,12 +3021,12 @@ mod tests {
 
     #[test]
     fn resolve_traversal_escapes_root() {
-        // Важно знать: текущая реализация resolve() НЕ блокирует traversal.
-        // Этот тест документирует фактическое поведение.
-        // Если в будущем добавить проверку — тест должен инвертироваться.
+        // Note: the current resolve() implementation does NOT block path traversal.
+        // This test documents the actual behavior as a known gap.
+        // If a traversal check is added in the future, this test should be inverted.
         let dir = tempfile::tempdir().unwrap();
         let result = resolve(dir.path(), "../../../etc/passwd");
-        // Сейчас это Ok, но путь уходит за пределы root
+        // Currently succeeds, but the resulting path escapes the root
         if let Ok(p) = result {
             assert!(!p.starts_with(dir.path()),
                 "resolve() currently does NOT block traversal — this documents the gap");
