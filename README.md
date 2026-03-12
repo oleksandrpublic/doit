@@ -193,7 +193,7 @@ do_it roles
 ## Authors
 
 Project concept inspired by [mini-swe-agent](https://mini-swe-agent.com/latest/).
-Built by [Claude Sonnet 4.6](https://www.anthropic.com/claude) with [Oleksandr](oleksandr.public@gmail.com).
+Built by [Claude Sonnet 4.6](https://www.anthropic.com/claude) with <oleksandr.public@gmail.com>.
 
 ## License
 
