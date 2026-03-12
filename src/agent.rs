@@ -34,7 +34,7 @@ impl SweAgent {
         let system_prompt = if role != Role::Default {
             role.system_prompt(&root)
         } else {
-            cfg.system_prompt
+            cfg.system_prompt.clone()
         };
 
         Ok(Self {
@@ -167,7 +167,8 @@ impl SweAgent {
 
     /// Run as a sub-agent: no banner, returns the finish summary as a string.
     /// Called from spawn_agent tool.
-    pub async fn run_capture(&mut self, task: &str) -> Result<String> {
+    pub fn run_capture<'a>(&'a mut self, task: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + 'a>> {
+        Box::pin(async move {
         println!("  [sub-agent: {}] task: {}", self.role.name(), task);
 
         self.session_init();
@@ -202,9 +203,11 @@ impl SweAgent {
             self.role.name(),
             self.max_steps
         ))
+        })
     }
 
-    async fn step(&mut self, task: &str, step: usize) -> Result<StepOutcome> {
+    fn step<'a>(&'a mut self, task: &'a str, step: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StepOutcome>> + 'a>> {
+        Box::pin(async move {
         let thinking_model = self.router.resolve(&ModelRole::Thinking, &self.default_model);
         let user_message = self.build_prompt(task, step);
 
@@ -297,6 +300,7 @@ impl SweAgent {
         }
 
         Ok(StepOutcome::Continue)
+        })
     }
 
     /// Detect if the agent is stuck in a loop.

@@ -38,15 +38,16 @@ pub struct TelegramConfig {
 // ─── Dispatch ─────────────────────────────────────────────────────────────────
 
 /// Execute a tool by name with JSON args, relative to `root`.
-pub async fn dispatch(
-    tool: &str,
-    args: &Value,
-    root: &Path,
+pub fn dispatch<'a>(
+    tool: &'a str,
+    args: &'a Value,
+    root: &'a Path,
     max_output: usize,
-    tg: &TelegramConfig,
-    cfg: &crate::config::AgentConfig,
+    tg: &'a TelegramConfig,
+    cfg: &'a crate::config::AgentConfig,
     sub_agent_max_steps: usize,
-) -> Result<ToolResult> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + 'a>> {
+    Box::pin(async move {
     let result = match tool {
         "read_file"        => read_file(args, root),
         "write_file"       => write_file(args, root),
@@ -97,6 +98,7 @@ pub async fn dispatch(
     }
 
     Ok(result)
+    })
 }
 
 // ─── Tool implementations ─────────────────────────────────────────────────────
@@ -2040,12 +2042,13 @@ async fn git_stash(args: &Value, root: &Path) -> Result<ToolResult> {
 ///   memory_key? — .ai/knowledge/ key where sub-agent should write results
 ///                 (default: "knowledge/<role>_result")
 ///   max_steps?  — override max steps (default: parent_sub_steps, min 5)
-async fn spawn_agent(
-    args: &Value,
-    root: &Path,
-    cfg: &crate::config::AgentConfig,
+fn spawn_agent<'a>(
+    args: &'a Value,
+    root: &'a Path,
+    cfg: &'a crate::config::AgentConfig,
     parent_sub_steps: usize,
-) -> Result<ToolResult> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + 'a>> {
+    Box::pin(async move {
     use crate::agent::SweAgent;
     use crate::config::Role;
 
@@ -2101,6 +2104,7 @@ async fn spawn_agent(
         role.name(),
         memory_key = memory_key,
     )))
+    })
 }
 
 // ─── github_api ───────────────────────────────────────────────────────────────
@@ -2203,7 +2207,7 @@ fn github_format_response(json: &serde_json::Value, endpoint: &str, method: &str
     if endpoint.contains("/contents/") && method == "GET" {
         if let Some(content_b64) = json.get("content").and_then(|v| v.as_str()) {
             let decoded = base64_decode_content(content_b64);
-            let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("file");
+            let _name = json.get("name").and_then(|v| v.as_str()).unwrap_or("file");
             let path = json.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let sha  = json.get("sha").and_then(|v| v.as_str()).unwrap_or("");
             return format!("File: {path} (sha: {sha})\n\n{decoded}");
