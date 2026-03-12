@@ -5,16 +5,30 @@
 
 An autonomous coding agent that runs local LLMs via [Ollama](https://ollama.com) to read, write, and fix code in your repositories. Works on Windows and Linux with no shell dependency, no Python, no cloud APIs.
 
+Inspired by [mini-swe-agent](https://mini-swe-agent.com/latest/) — a minimal, transparent approach to software engineering agents. 
+
+**do_it** extends that foundation with persistent memory, multi-role orchestration, sub-agents, GitHub integration, and a significantly expanded tool set. 
+
+Most of the new features were designed and implemented by [Claude Sonnet 4.6](https://www.anthropic.com/claude).
+
 ---
 
 ## Features
 
-- **Local-first** — runs entirely on your machine via Ollama
-- **Cross-platform** — Windows (MSVC) and Linux, no shell operators
-- **Agent roles** — restrict tools and prompts per task type (`developer`, `navigator`, `qa`, `boss`, `research`, `memory`)
-- **Persistent memory** — `.ai/` hierarchy: plan, last session notes, knowledge base
-- **Rich tool set** — filesystem, git, web search, code intelligence (AST), Telegram notifications
-- **Model routing** — use different models per role (e.g. a large coder model for `developer`, a small fast model for `navigator`)
+- **Local-first** — runs entirely on your machine via Ollama, no cloud APIs required
+- **Cross-platform** — Windows (MSVC) and Linux, no shell operators, no Python
+- **Agent roles** — focused tool sets and prompts per task type: `developer`, `navigator`, `qa`, `boss`, `research`, `memory`
+- **Sub-agent orchestration** — `boss` role delegates to specialised sub-agents via `spawn_agent`; results flow through shared memory
+- **Persistent memory** — `.ai/` hierarchy: session notes, task plan, knowledge base, architectural decisions, lessons learned
+- **Project auto-detection** — `.ai/project.toml` scaffolded on first run with commands, GitHub repo, and agent conventions
+- **GitHub integration** — `github_api` tool for issues, PRs, branches, commits, file contents (token from env)
+- **Test coverage** — `test_coverage` auto-detects Rust/Node/Python and runs the right tool
+- **Telegram notifications** — `ask_human` for blocking questions, `notify` for non-blocking progress updates
+- **Loop detection** — automatically detects stuck patterns and sends a Telegram alert
+- **Model routing** — use different models per role (e.g. a large coder model for `developer`, a small fast one for `navigator`)
+- **Vision support** — pass an image as `--task` for visual debugging (requires vision-capable model)
+
+---
 
 ## Quick Start
 
@@ -28,9 +42,14 @@ cargo install do_it
 # 3. Run
 do_it run --task "Find and fix the bug in src/parser.rs" --repo /path/to/project
 
-# With a role (recommended for smaller models)
+# With a role (recommended)
 do_it run --task "Add input validation to handlers.rs" --role developer
+
+# Orchestrate a complex task with sub-agents
+do_it run --task "Add OAuth2 login to the API" --role boss --max-steps 80
 ```
+
+---
 
 ## Roles
 
@@ -38,33 +57,81 @@ Each role restricts the agent to a focused set of tools and a role-specific syst
 
 | Role | Purpose | Key tools |
 |---|---|---|
-| `developer` | Write and edit code | read/write file, str_replace, run_command, git, AST |
+| `developer` | Write and edit code | read/write file, str_replace, run_command, git, AST, github_api, test_coverage |
 | `navigator` | Explore codebase structure | tree, find_files, search, outline, find_references |
 | `research` | Find information | web_search, fetch_url, memory |
-| `qa` | Run tests, verify changes | run_command, diff_repo, git_log, search |
-| `boss` | Plan and orchestrate | memory, tree, web_search, ask_human |
+| `qa` | Run tests, verify changes | test_coverage, diff_repo, git_log, search, github_api |
+| `boss` | Plan and orchestrate | memory, spawn_agent, web_search, ask_human, notify |
 | `memory` | Manage `.ai/` state | memory_read, memory_write |
 
 ```bash
 do_it roles   # list all roles and their tool allowlists
 ```
 
+---
+
 ## Tools
 
 **Filesystem:** `read_file`, `write_file`, `str_replace`, `list_dir`, `find_files`, `search_in_files`, `tree`
 
-**Execution:** `run_command`, `diff_repo`
+**Execution:** `run_command`, `diff_repo`, `test_coverage`
 
 **Git:** `git_status`, `git_commit`, `git_log`, `git_stash`
 
-**Internet:** `web_search` (DuckDuckGo, no API key), `fetch_url`
+**Internet:** `web_search` (DuckDuckGo, no API key), `fetch_url`, `github_api`
 
 **Code intelligence** (Rust, TypeScript, JavaScript, Python, C++, Kotlin):
 `get_symbols`, `outline`, `get_signature`, `find_references`
 
 **Memory** (`.ai/` hierarchy): `memory_read`, `memory_write`
 
-**Communication:** `ask_human` (Telegram or console), `finish`
+**Communication:** `ask_human` (Telegram or console), `notify` (one-way Telegram), `finish`
+
+**Multi-agent:** `spawn_agent`
+
+---
+
+## Sub-agent Orchestration
+
+The `boss` role can spawn specialised sub-agents. Sub-agents run in-process with isolated history and communicate through shared `.ai/knowledge/` memory.
+
+```bash
+do_it run --task "Add OAuth2 login" --role boss --max-steps 80
+```
+
+```
+boss: reads last_session, plan, decisions
+  │
+  ├─ spawn_agent("research", "find best OAuth crates for Axum", memory_key="knowledge/oauth")
+  ├─ spawn_agent("navigator", "locate existing auth middleware", memory_key="knowledge/structure")
+  ├─ spawn_agent("developer", "implement OAuth per the plan")
+  ├─ spawn_agent("qa", "verify all tests pass", memory_key="knowledge/qa_report")
+  └─ notify("OAuth complete, all tests pass") → finish
+```
+
+---
+
+## Persistent Memory
+
+```
+.ai/
+├── project.toml           ← auto-scaffolded on first run, edit freely
+├── prompts/               ← custom role prompt overrides
+├── state/
+│   ├── current_plan.md        ← boss writes task breakdown here
+│   ├── last_session.md        ← agent reads this on startup
+│   ├── session_counter.txt
+│   └── external_messages.md  ← external inbox, read and cleared on startup
+├── logs/history.md
+└── knowledge/
+    ├── lessons_learned.md     ← QA appends project-specific patterns
+    ├── decisions.md           ← architectural decisions and rationale
+    └── qa_report.md           ← latest test results
+```
+
+Write to `external_messages.md` before a run to send instructions without changing `--task`. The agent reads it on startup and clears it.
+
+---
 
 ## Configuration
 
@@ -83,33 +150,19 @@ coding    = "qwen3-coder-next"
 search    = "qwen3.5:4b"
 execution = "qwen3.5:4b"
 
-# Optional: Telegram notifications for ask_human
+# Optional: Telegram for ask_human and notify
 # telegram_token   = "..."
 # telegram_chat_id = "..."
 ```
+
+Config priority: `--config` flag → `./config.toml` → `~/.do_it/config.toml` → built-in defaults.
+On first run, `~/.do_it/` is created with a full template.
 
 ```bash
 do_it config   # show resolved config
 ```
 
-## Memory hierarchy
-
-The agent maintains persistent state in `.ai/` at the repository root:
-
-```
-.ai/
-├── prompts/          ← custom role prompts (override built-ins)
-├── state/
-│   ├── current_plan.md
-│   ├── last_session.md    ← agent reads this on startup
-│   └── session_counter.txt
-├── logs/history.md
-└── knowledge/             ← agent-written notes about the project
-```
-
-At session start, `last_session.md` is automatically injected into context so the agent remembers what it did before.
-
-Custom role prompts: create `.ai/prompts/developer.md` to override the built-in developer prompt for a specific project.
+---
 
 ## CLI
 
@@ -125,16 +178,22 @@ do_it config [--config <path>]
 do_it roles
 ```
 
+---
+
 ## Roadmap
 
-- [ ] `spawn_agent` — boss delegates subtasks to role-specific sub-agents
 - [ ] `git_push` / `git_pull` structured tools
+- [ ] Parallel sub-agent execution
 - [ ] Web search providers beyond DuckDuckGo
 - [ ] Tree-sitter backend for more accurate AST analysis
+- [ ] Browser/screenshot tool (watching developments from major providers)
+
+---
 
 ## Authors
 
-Built by [Claude Sonnet 4.6](https://www.anthropic.com/claude) with Oleksandr.
+Project concept inspired by [mini-swe-agent](https://mini-swe-agent.com/latest/).
+Built by [Claude Sonnet 4.6](https://www.anthropic.com/claude) with [Oleksandr](oleksandr.public@gmail.com).
 
 ## License
 

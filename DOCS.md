@@ -1,6 +1,10 @@
 # do_it — Documentation
 
-An autonomous coding agent powered by local LLMs via [Ollama](https://ollama.com). Reads, writes, and fixes code in your repositories. Runs on Windows and Linux with no shell dependency, no Python, no cloud APIs.
+An autonomous coding agent powered by local LLMs via [Ollama](https://ollama.com). 
+
+Reads, writes, and fixes code in your repositories. 
+
+Runs on Windows and Linux with no shell dependency, no Python, no cloud APIs.
 
 ---
 
@@ -12,14 +16,15 @@ An autonomous coding agent powered by local LLMs via [Ollama](https://ollama.com
 4. [CLI Reference](#cli-reference)
 5. [Agent Roles](#agent-roles)
 6. [Tools](#tools)
-7. [Telegram — ask_human](#telegram--ask_human)
+7. [Telegram — ask_human and notify](#telegram--ask_human-and-notify)
 8. [How the Agent Works](#how-the-agent-works)
 9. [Model Selection and Routing](#model-selection-and-routing)
-10. [Sub-agent Architecture (Roadmap)](#sub-agent-architecture-roadmap)
-11. [Limitations](#limitations)
-12. [Tips and Recommendations](#tips-and-recommendations)
-13. [Troubleshooting](#troubleshooting)
-14. [Project Structure](#project-structure)
+10. [Sub-agent Architecture](#sub-agent-architecture)
+11. [Persistent Memory](#persistent-memory)
+12. [Limitations](#limitations)
+13. [Tips and Recommendations](#tips-and-recommendations)
+14. [Troubleshooting](#troubleshooting)
+15. [Project Structure](#project-structure)
 
 ---
 
@@ -29,18 +34,14 @@ An autonomous coding agent powered by local LLMs via [Ollama](https://ollama.com
 # 1. Pull a model
 ollama pull qwen3.5:9b
 
-# 2. Build
-cargo build --release
+# 2. Install
+cargo install do_it
 
 # 3. Run
-./target/release/do_it run \
-  --task "Find and fix the bug in src/parser.rs" \
-  --repo /path/to/project
+do_it run --task "Find and fix the bug in src/parser.rs" --repo /path/to/project
 
 # With a role (recommended for smaller models)
-./target/release/do_it run \
-  --task "Add input validation to handlers.rs" \
-  --role developer
+do_it run --task "Add input validation to handlers.rs" --role developer
 ```
 
 Windows:
@@ -88,7 +89,14 @@ curl http://localhost:11434/api/tags  # verify Ollama is running
 
 ## Configuration
 
-All configuration lives in `config.toml`. If the file is not found, the agent runs with built-in defaults.
+Configuration is loaded from the first file found in this priority order:
+
+1. `--config <path>` — explicit path passed on the command line
+2. `./config.toml` — local project config (in the working directory)
+3. `~/.do_it/config.toml` — global user config (created automatically on first run)
+4. Built-in defaults
+
+On first run, `~/.do_it/` is created with a default `config.toml` and a `system_prompt.md` template.
 
 ```toml
 # Ollama endpoint
@@ -112,7 +120,7 @@ max_output_chars = 6000
 # System prompt (overridden by --role and --system-prompt)
 system_prompt = """..."""
 
-# Optional: Telegram for ask_human / notifications
+# Optional: Telegram for ask_human / notify
 # telegram_token   = "1234567890:ABCdef..."
 # telegram_chat_id = "123456789"
 
@@ -173,6 +181,9 @@ do_it run --task "Add rate limiting" --role developer
 do_it run --task "What does this project do?" --role navigator
 do_it run --task "Find docs for tower-http middleware" --role research
 
+# Orchestrate a complex task with sub-agents
+do_it run --task "Add OAuth2 login" --role boss --max-steps 60
+
 # Task from file
 do_it run --task tasks/issue-42.md --role developer --repo ~/projects/my-app
 
@@ -211,11 +222,11 @@ do_it roles   # print all roles and their allowlists
 | Role | Purpose | Key tools |
 |---|---|---|
 | `default` | No restrictions | all tools |
-| `boss` | Orchestration and planning | `memory_read/write`, `tree`, `web_search`, `ask_human` |
+| `boss` | Orchestration — plans tasks, delegates to sub-agents | `memory_read/write`, `tree`, `web_search`, `ask_human`, `spawn_agent`, `notify` |
 | `research` | Information gathering | `web_search`, `fetch_url`, `memory_read/write`, `ask_human` |
-| `developer` | Reading and writing code | `read/write_file`, `str_replace`, `run_command`, `diff_repo`, `git_*`, AST tools |
+| `developer` | Reading and writing code | `read/write_file`, `str_replace`, `run_command`, `diff_repo`, `git_*`, AST tools, `github_api`, `test_coverage`, `notify` |
 | `navigator` | Exploring codebase structure | `tree`, `list_dir`, `find_files`, `search_in_files`, `find_references`, AST tools |
-| `qa` | Testing and verification | `run_command`, `read_file`, `search_in_files`, `diff_repo`, `git_status`, `git_log` |
+| `qa` | Testing and verification | `run_command`, `read_file`, `search_in_files`, `diff_repo`, `git_status`, `git_log`, `github_api`, `test_coverage`, `notify` |
 | `memory` | Managing `.ai/` state | `memory_read`, `memory_write` |
 
 ### System prompt priority
@@ -226,6 +237,8 @@ do_it roles   # print all roles and their allowlists
 --role           → looks for .ai/prompts/<role>.md, falls back to built-in
   ↓
 system_prompt in config.toml
+  ↓
+~/.do_it/system_prompt.md  (global override)
   ↓
 built-in DEFAULT_SYSTEM_PROMPT  (lowest)
 ```
@@ -286,6 +299,22 @@ All tools are implemented in native Rust (`src/tools.rs`) with no shell dependen
 |---|---|---|
 | `web_search` | `query`, `max_results?` | Search via DuckDuckGo (no API key required) |
 | `fetch_url` | `url`, `selector?` | Fetch a web page and return readable text |
+| `github_api` | `method`, `endpoint`, `body?`, `token?` | GitHub REST API — issues, PRs, branches, commits, file contents |
+
+`github_api` requires a `GITHUB_TOKEN` environment variable (or `token` argument). Responses are automatically filtered to keep context concise — file contents are base64-decoded automatically.
+
+Common endpoints:
+```
+GET  /repos/{owner}/{repo}/issues              — list open issues
+GET  /repos/{owner}/{repo}/issues/{n}          — read single issue
+POST /repos/{owner}/{repo}/issues/{n}/comments — post a comment
+PATCH /repos/{owner}/{repo}/issues/{n}         — update issue (state/labels)
+GET  /repos/{owner}/{repo}/pulls               — list open PRs
+POST /repos/{owner}/{repo}/pulls               — create PR
+PUT  /repos/{owner}/{repo}/pulls/{n}/merge     — merge PR
+GET  /repos/{owner}/{repo}/branches            — list branches
+GET  /repos/{owner}/{repo}/contents/{path}     — read file (auto-decoded)
+```
 
 ### Code Intelligence
 
@@ -299,6 +328,14 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 | `find_references` | `name`, `dir?`, `ext?` | All usages of a symbol across the codebase |
 
 `kinds` filter examples: `"fn,struct"`, `"class,interface"`, `"fn,method"`.
+
+### Testing
+
+| Tool | Arguments | Description |
+|---|---|---|
+| `test_coverage` | `dir?`, `threshold?` | Run tests with coverage (auto-detects Rust/Node/Python) |
+
+`test_coverage` detects the project type from `Cargo.toml` / `package.json` / `pyproject.toml` and runs the appropriate tool (`cargo tarpaulin`, `jest --coverage`, `pytest --cov`). Falls back to `cargo test` if tarpaulin is not installed. Returns `success=false` if coverage is below `threshold` (default: 80%).
 
 ### Memory (`.ai/` hierarchy)
 
@@ -320,16 +357,34 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 | `prompts/<n>` | `.ai/prompts/<n>.md` |
 | any other key | `.ai/knowledge/<key>.md` |
 
+**Persistent knowledge keys used by built-in roles:**
+
+| Key | Written by | Purpose |
+|---|---|---|
+| `knowledge/lessons_learned` | QA | Project-specific pitfalls and correct patterns |
+| `knowledge/decisions` | Boss, Developer | Architectural decisions and rationale |
+| `knowledge/qa_report` | QA | Latest test run report |
+| `knowledge/<role>_result` | Sub-agents | Results from `spawn_agent` calls |
+
 ### Communication
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `ask_human` | `question` | Send a question via Telegram (if configured) or console |
+| `ask_human` | `question` | Send a question via Telegram and wait up to 5 min for reply; falls back to console |
+| `notify` | `message`, `silent?` | Send a one-way Telegram notification (non-blocking, no waiting) |
 | `finish` | `summary`, `success` | Signal task completion |
+
+### Multi-agent
+
+| Tool | Arguments | Description |
+|---|---|---|
+| `spawn_agent` | `role`, `task`, `memory_key?`, `max_steps?` | Delegate a subtask to a specialised sub-agent |
+
+See [Sub-agent Architecture](#sub-agent-architecture) for details.
 
 ---
 
-## Telegram — ask_human
+## Telegram — ask_human and notify
 
 ### Setup
 
@@ -343,25 +398,71 @@ telegram_token   = "1234567890:ABCdef-ghijklmnop"
 telegram_chat_id = "123456789"
 ```
 
-### How it works
+### ask_human
 
-When the agent calls `ask_human`:
-1. Sends the question to Telegram
-2. Polls every 5 seconds, waits up to 5 minutes for a reply
-3. Your reply is returned to the agent as the tool result
-4. If Telegram is not configured or unreachable — falls back to console stdin
+Sends a question and waits up to 5 minutes for your reply. Your reply is returned to the agent as the tool result. Falls back to console stdin if Telegram is not configured or unreachable.
+
+Use this when the agent needs a decision before continuing — it will not guess on important choices.
+
+### notify
+
+Sends a one-way message with no waiting. Used for progress updates and completion notices during long autonomous runs. Falls back to stdout if Telegram is not configured.
+
+```json
+{ "tool": "notify", "args": { "message": "OAuth implementation complete, running tests..." } }
+{ "tool": "notify", "args": { "message": "All tests pass. PR created.", "silent": true } }
+```
+
+### External messages (inbox)
+
+To send instructions to the agent before its next run, write to `.ai/state/external_messages.md`. On startup, the agent reads this file, injects it into context, and clears it. Any external process — a webhook, a cron script, another agent — can write to this file.
+
+```bash
+echo "## 2024-01-15 10:30
+Please also update the README after the refactor." >> .ai/state/external_messages.md
+```
+
+The next run will show: `[inbox] 2 external message(s) received`.
 
 ---
 
 ## How the Agent Works
 
-### Main loop (`src/agent.rs`)
+### Session initialisation (`src/agent.rs`)
 
 ```
 session_init():
   → increment .ai/state/session_counter.txt
-  → read last_session.md → inject as step 0 in history
+  → read last_session.md          → inject into history as step 0
+  → read external_messages.md     → inject into history, then clear the file
+  → read/scaffold .ai/project.toml → inject into history as project context
+```
 
+On first run in a new repository, `.ai/project.toml` is scaffolded automatically by detecting `Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` and reading the GitHub remote from `.git/config`. Edit it freely — it will not be overwritten.
+
+```toml
+# .ai/project.toml (auto-generated, edit as needed)
+[project]
+name     = "my-project"
+language = "rust"
+
+[commands]
+test  = "cargo test"
+build = "cargo build --release"
+lint  = "cargo clippy -- -D warnings"
+
+[github]
+repo = "owner/my-project"
+
+[agent]
+notes = """
+- Always run clippy before committing
+"""
+```
+
+### Main loop
+
+```
 if --task is an image:
   → vision model describes it → description becomes effective_task
 
@@ -371,8 +472,18 @@ for each step 1..max_steps:
   3. if specialist model differs → re-call with specialist
   4. execute tool
   5. record in history
-  6. if tool == "finish" → done
+  6. loop detection → notify if stuck
+  7. if tool == "finish" → done
 ```
+
+### Loop detection
+
+After each step the agent checks for two stuck patterns:
+
+- **Repeated failures** — same tool failed 3 times in a row
+- **Repeated calls** — same tool with identical args called 4 times in a row
+
+When detected: logs a warning and sends a Telegram notification. The agent does not stop — it continues and may self-correct, but you are informed.
 
 ### Context window (`src/history.rs`)
 
@@ -419,51 +530,108 @@ ollama_base_url = "http://192.168.1.100:11434"
 
 ---
 
-## Sub-agent Architecture (Roadmap)
+## Sub-agent Architecture
 
-The current role system is the foundation for full sub-agent orchestration.
+`spawn_agent` lets the `boss` role delegate subtasks to specialised sub-agents. Each sub-agent runs in-process with its own history, role prompt, and tool allowlist. Communication between boss and sub-agents goes through the shared `.ai/knowledge/` memory.
 
-### Planned: `spawn_agent(role, task)`
+### Usage
 
-A new tool that lets the `boss` agent delegate subtasks to specialised sub-agents. Each sub-agent runs with its own history, role prompt, and tool allowlist. The result is returned as a string to the boss's history.
-
-### Execution flow (planned)
-
-```
-do_it run --task "Add OAuth" --role boss
-  │
-  ├─ boss: reads plan, decomposes task
-  │
-  ├─ spawn_agent(role="research", task="find best OAuth crates for Axum")
-  │    └─ research agent → memory_write("knowledge/oauth_crates", ...)
-  │
-  ├─ spawn_agent(role="navigator", task="find current auth middleware location")
-  │    └─ navigator agent → returns structure summary
-  │
-  ├─ spawn_agent(role="developer", task="implement OAuth per the plan")
-  │    └─ developer agent → writes code, runs tests
-  │
-  └─ spawn_agent(role="qa", task="verify all tests pass")
-       └─ qa agent → runs tests → writes report
+```json
+{
+  "tool": "spawn_agent",
+  "args": {
+    "role": "research",
+    "task": "Find the best OAuth2 crates for Axum in 2024",
+    "memory_key": "knowledge/oauth_research",
+    "max_steps": 15
+  }
+}
 ```
 
-### `.ai/` memory hierarchy (already implemented)
+After the sub-agent finishes, the boss reads the results:
+
+```json
+{ "tool": "memory_read", "args": { "key": "knowledge/oauth_research" } }
+```
+
+### Arguments
+
+| Argument | Required | Description |
+|---|---|---|
+| `role` | yes | Sub-agent role: `research`, `developer`, `navigator`, `qa`, `memory` |
+| `task` | yes | Task description — what the sub-agent should do |
+| `memory_key` | no | Where to write results (default: `knowledge/agent_result`) |
+| `max_steps` | no | Step limit (default: parent's `max_steps / 2`, min 5) |
+
+Boss cannot spawn another boss (recursion guard).
+
+### Full orchestration example
+
+```bash
+do_it run --task "Add OAuth2 login to the API" --role boss --max-steps 80
+```
+
+```
+boss: reads last_session, plan, decisions → writes task breakdown to plan
+  │
+  ├─ spawn_agent(role="research", task="find best OAuth crates for Axum",
+  │              memory_key="knowledge/oauth_research")
+  │    └─ research agent searches web, writes findings
+  │
+  ├─ memory_read("knowledge/oauth_research")
+  │
+  ├─ spawn_agent(role="navigator", task="find current auth middleware location",
+  │              memory_key="knowledge/auth_structure")
+  │    └─ navigator explores codebase, maps existing code
+  │
+  ├─ spawn_agent(role="developer", task="implement OAuth2 per the plan",
+  │              memory_key="knowledge/impl_notes")
+  │    └─ developer writes code, runs tests, commits
+  │
+  ├─ spawn_agent(role="qa", task="verify all tests pass, check coverage",
+  │              memory_key="knowledge/qa_report")
+  │    └─ qa runs test_coverage, writes report, appends lessons_learned
+  │
+  └─ boss: reads qa_report → notify("OAuth2 complete, all tests pass") → finish
+```
+
+---
+
+## Persistent Memory
+
+The agent maintains persistent state in `.ai/` at the repository root. This directory is gitignored by default.
 
 ```
 .ai/
+├── project.toml           ← project config (auto-scaffolded, edit freely)
 ├── prompts/               ← custom role prompts (override built-ins per project)
 │   ├── boss.md
 │   ├── developer.md
 │   └── qa.md
 ├── state/
-│   ├── current_plan.md    ← boss writes the task plan here
-│   ├── last_session.md    ← read on startup, written at end of session
+│   ├── current_plan.md        ← boss writes the task plan here
+│   ├── last_session.md        ← read on startup, written at end of session
 │   ├── session_counter.txt
-│   └── external_messages.md
+│   └── external_messages.md  ← external inbox, read and cleared on startup
 ├── logs/
 │   └── history.md
-└── knowledge/             ← agent-written notes about the project
+└── knowledge/                 ← agent-written project knowledge
+    ├── lessons_learned.md     ← QA appends project-specific patterns after each session
+    ├── decisions.md           ← Boss/Developer log architectural decisions + rationale
+    └── qa_report.md           ← latest test run
 ```
+
+### What each file is for
+
+**`last_session.md`** — the agent writes a note to its future self at the end of every session: what was done, what is pending, any important context. Read automatically on next startup.
+
+**`external_messages.md`** — your inbox for the agent. Write anything here before a run; the agent will see it on startup and the file is cleared. Use this for instructions that don't fit as a `--task` flag, or to send notes from an external process.
+
+**`project.toml`** — permanent project context injected every session. Commands for test/build/lint, GitHub repo name, agent conventions. Edit once, used forever.
+
+**`lessons_learned.md`** — QA appends project-specific anti-patterns and correct approaches after each session. The agent reads this before starting work to avoid repeating mistakes.
+
+**`decisions.md`** — Boss and Developer log significant architectural decisions: what was chosen, what alternatives were considered, and why. Consulted before redesigning anything.
 
 ---
 
@@ -481,7 +649,11 @@ do_it run --task "Add OAuth" --role boss
 
 **Code intelligence** — regex-based, covers ~95% of real-world cases. Does not handle macros, conditional compilation, or dynamically generated code.
 
+**`test_coverage`** — requires `cargo-tarpaulin` for Rust coverage numbers. Install with `cargo install cargo-tarpaulin`. Falls back to `cargo test` without coverage % if not installed.
+
 **Vision** — qwen3.5 supports images, but current GGUF files in Ollama may not include the mmproj component. Use llama.cpp directly for guaranteed vision support.
+
+**`spawn_agent`** — sub-agents run sequentially (one at a time). Parallel execution is not yet supported.
 
 ---
 
@@ -490,11 +662,11 @@ do_it run --task "Add OAuth" --role boss
 ### Choose the right role
 
 ```bash
-do_it run --task "What does this project do?"            --role navigator
+do_it run --task "What does this project do?"             --role navigator
 do_it run --task "Find examples of using axum extractors" --role research
-do_it run --task "Add validation to src/handlers.rs"     --role developer
-do_it run --task "Do all tests pass?"                    --role qa
-do_it run --task "Plan the auth module refactor"         --role boss
+do_it run --task "Add validation to src/handlers.rs"      --role developer
+do_it run --task "Do all tests pass?"                     --role qa
+do_it run --task "Plan the auth module refactor"          --role boss
 ```
 
 ### Before running
@@ -533,6 +705,17 @@ All public items require doc comments.
 EOF
 ```
 
+### Using GitHub API
+
+Set `GITHUB_TOKEN` in your environment (classic token with `repo` scope is sufficient):
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
+do_it run --task "Find all open bugs and fix the highest priority one" --role developer
+```
+
+The agent can list issues, read them, post comments, create PRs, and read file contents directly from GitHub — useful when working across repositories.
+
 ---
 
 ## Troubleshooting
@@ -551,7 +734,7 @@ ollama pull qwen3.5:9b
 ollama list
 ```
 
-**`LLM response has no JSON`** — the model responded outside of JSON format. Try a larger model, set `temperature = 0.0`, or use a role to reduce the tool count. Add `IMPORTANT: respond ONLY with a JSON object.` to the system prompt.
+**`LLM response has no JSON`** — the model responded outside of JSON format. Try a larger model, set `temperature = 0.0`, or use a role to reduce the tool count.
 
 **`str_replace: old_str found N times`** — provide more context to make `old_str` unique:
 ```json
@@ -560,9 +743,15 @@ ollama list
 
 **`ask_human via Telegram: no reply received within 5 minutes`** — verify the bot token and chat_id, and that you have sent `/start` to the bot. The agent continues with an error and falls back to console.
 
-**`fetch_url: HTTP 403` or empty result** — the site blocks bots or requires JavaScript. Use direct API endpoints instead: `raw.githubusercontent.com` instead of `github.com`.
+**`fetch_url: HTTP 403` or empty result** — the site blocks bots or requires JavaScript. Use direct API endpoints: `raw.githubusercontent.com` instead of `github.com`.
 
-**Agent is looping** — reduce `history_window` to 4, restart with a more specific task, or use a larger model.
+**`github_api: no token found`** — set `GITHUB_TOKEN` environment variable or pass `"token"` in args.
+
+**`test_coverage: cargo tarpaulin not found`** — install with `cargo install cargo-tarpaulin`. The tool falls back to `cargo test` without coverage numbers.
+
+**Agent is looping** — the built-in loop detector will notify you via Telegram. You can also reduce `history_window` to 4, restart with a more specific task, or use a larger model.
+
+**Sub-agent stuck** — if `spawn_agent` takes too long, the sub-agent is limited by `max_steps`. Pass a smaller `max_steps` explicitly, or break the task into smaller pieces.
 
 ---
 
@@ -570,24 +759,25 @@ ollama list
 
 ```
 do_it/
-├── Cargo.toml           name="do_it", edition="2024", version="0.2.0"
+├── Cargo.toml           name="do_it", edition="2024", version="0.2.1"
 ├── config.toml          runtime configuration (models, Telegram, prompt)
 ├── README.md            project overview
 ├── DOCS.md              this file
 ├── LICENSE              MIT
 ├── .gitignore
 ├── .ai/                 agent memory (created automatically, gitignored)
+│   ├── project.toml     project config (auto-scaffolded)
 │   ├── prompts/         custom role prompts
-│   ├── state/           plan, last_session, session_counter
+│   ├── state/           plan, last_session, session_counter, external_messages
 │   ├── logs/            history.md
-│   └── knowledge/       agent-written project notes
+│   └── knowledge/       lessons_learned, decisions, qa_report, sub-agent results
 └── src/
     ├── main.rs          CLI: run | config | roles; --role flag; image detection
-    ├── agent.rs         main loop, role enforcement, tool allowlist, session_init
-    ├── config.rs        AgentConfig, Role enum + allowlists + built-in prompts, ModelRouter
+    ├── agent.rs         main loop, session_init, loop detection, project.toml scaffolding
+    ├── config.rs        AgentConfig, Role enum + allowlists + built-in prompts, ModelRouter, ensure_global_config
     ├── history.rs       sliding window context manager
     ├── shell.rs         Ollama HTTP client: chat, chat_with_image, check_models
-    └── tools.rs         all 19 ACI tools; 6-language AST parsers
+    └── tools.rs         all tools: filesystem, git, web, GitHub API, AST, memory, spawn_agent, notify, test_coverage
 ```
 
 ### Dependencies
@@ -595,12 +785,12 @@ do_it/
 | Crate | Purpose |
 |---|---|
 | `tokio` | async runtime |
-| `reqwest` | HTTP — Ollama, fetch_url, web_search, Telegram API |
+| `reqwest` | HTTP — Ollama, fetch_url, web_search, Telegram API, GitHub API |
 | `serde` / `serde_json` | JSON serialization |
-| `toml` | config.toml parsing |
+| `toml` | config.toml / project.toml parsing |
 | `clap` | CLI argument parsing |
 | `walkdir` | recursive filesystem traversal |
 | `regex` | search_in_files, find_references, AST parsers |
-| `base64` | image encoding for vision |
+| `base64` | image encoding for vision; GitHub file contents decoding |
 | `anyhow` | error handling |
 | `tracing` / `tracing-subscriber` | structured logging |

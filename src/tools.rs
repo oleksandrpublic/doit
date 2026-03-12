@@ -44,6 +44,8 @@ pub async fn dispatch(
     root: &Path,
     max_output: usize,
     tg: &TelegramConfig,
+    cfg: &crate::config::AgentConfig,
+    sub_agent_max_steps: usize,
 ) -> Result<ToolResult> {
     let result = match tool {
         "read_file"        => read_file(args, root),
@@ -68,13 +70,17 @@ pub async fn dispatch(
         "git_commit"       => git_commit(args, root).await,
         "git_log"          => git_log(args, root).await,
         "git_stash"        => git_stash(args, root).await,
+        "spawn_agent"      => spawn_agent(args, root, cfg, sub_agent_max_steps).await,
+        "github_api"       => github_api(args).await,
+        "test_coverage"    => test_coverage(args, root).await,
+        "notify"           => notify(args, tg).await,
         "finish"           => Ok(ToolResult::ok("__finish__")),
         unknown => bail!(
             "Unknown tool: '{unknown}'. Available: read_file, write_file, str_replace, \
              list_dir, find_files, search_in_files, run_command, fetch_url, web_search, \
              ask_human, diff_repo, tree, memory_read, memory_write, \
              get_symbols, outline, get_signature, find_references, \
-             git_status, git_commit, git_log, git_stash, finish"
+             git_status, git_commit, git_log, git_stash, spawn_agent, github_api, test_coverage, notify, finish"
         ),
     }?;
 
@@ -2018,4 +2024,491 @@ async fn git_stash(args: &Value, root: &Path) -> Result<ToolResult> {
     };
 
     Ok(ToolResult::ok(out.trim().to_string()))
+}
+// ─── spawn_agent ──────────────────────────────────────────────────────────────
+
+/// Spawn a sub-agent with a given role and task.
+/// The sub-agent runs in-process with its own history and tool allowlist.
+///
+/// Communication pattern: through .ai/knowledge/ (shared memory).
+/// The sub-agent is expected to write its findings via memory_write.
+/// spawn_agent tells the boss which key to read after completion.
+///
+/// Args:
+///   role        — agent role: research | developer | navigator | qa | memory
+///   task        — task description (string)
+///   memory_key? — .ai/knowledge/ key where sub-agent should write results
+///                 (default: "knowledge/<role>_result")
+///   max_steps?  — override max steps (default: parent_sub_steps, min 5)
+async fn spawn_agent(
+    args: &Value,
+    root: &Path,
+    cfg: &crate::config::AgentConfig,
+    parent_sub_steps: usize,
+) -> Result<ToolResult> {
+    use crate::agent::SweAgent;
+    use crate::config::Role;
+
+    let role_str = str_arg(args, "role")?;
+    let task     = str_arg(args, "task")?;
+
+    let role = Role::from_str(role_str).ok_or_else(|| {
+        anyhow::anyhow!(
+            "spawn_agent: unknown role '{role_str}'. \
+             Valid roles: research, developer, navigator, qa, memory"
+        )
+    })?;
+
+    // Prevent infinite recursion: boss cannot spawn another boss
+    if role == Role::Boss {
+        return Ok(ToolResult {
+            output: "spawn_agent: cannot spawn a boss sub-agent (recursion guard)".into(),
+            success: false,
+        });
+    }
+
+    let memory_key = args
+        .get("memory_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| "knowledge/agent_result")
+        .to_string();
+
+    let max_steps = args
+        .get("max_steps")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(parent_sub_steps.max(5));
+
+    // Inject memory_key instruction into the task so the sub-agent knows where to write
+    let augmented_task = format!(
+        "{task}\n\n\
+        IMPORTANT: When finished, write your results and findings to memory key \"{memory_key}\" \
+        using memory_write before calling finish."
+    );
+
+    let repo_str = root.to_string_lossy().to_string();
+
+    let mut sub = SweAgent::new(cfg.clone(), &repo_str, max_steps, role.clone())
+        .map_err(|e| anyhow::anyhow!("spawn_agent: failed to create sub-agent: {e}"))?;
+
+    sub.run_capture(&augmented_task).await?;
+
+    // Tell the boss where to find the results
+    Ok(ToolResult::ok(format!(
+        "{} agent finished ({max_steps} steps max).\n\
+        Results written to memory key \"{memory_key}\".\n\
+        Use memory_read(\"{memory_key}\") to access them.",
+        role.name(),
+        memory_key = memory_key,
+    )))
+}
+
+// ─── github_api ───────────────────────────────────────────────────────────────
+
+/// GitHub REST API client with smart response filtering.
+/// Requires GITHUB_TOKEN env var (or token arg).
+///
+/// Args:
+///   method    — "GET" | "POST" | "PATCH" | "PUT" | "DELETE" (default: "GET")
+///   endpoint  — path, e.g. "/repos/owner/repo/issues" or full https:// URL
+///   body?     — JSON object for POST/PATCH/PUT
+///   token?    — overrides GITHUB_TOKEN env var
+///
+/// Issues:
+///   GET  /repos/{owner}/{repo}/issues              — list open issues
+///   GET  /repos/{owner}/{repo}/issues/{n}          — read single issue
+///   POST /repos/{owner}/{repo}/issues/{n}/comments — post a comment
+///   PATCH /repos/{owner}/{repo}/issues/{n}         — update (state/labels/assignees)
+///
+/// Pull Requests:
+///   GET  /repos/{owner}/{repo}/pulls               — list open PRs
+///   GET  /repos/{owner}/{repo}/pulls/{n}           — read single PR
+///   POST /repos/{owner}/{repo}/pulls               — create PR
+///   PUT  /repos/{owner}/{repo}/pulls/{n}/merge     — merge PR
+///
+/// Repo info:
+///   GET  /repos/{owner}/{repo}/branches            — list branches
+///   GET  /repos/{owner}/{repo}/commits             — recent commits
+///   GET  /repos/{owner}/{repo}/contents/{path}     — file contents (base64 decoded automatically)
+async fn github_api(args: &Value) -> Result<ToolResult> {
+    let method   = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET").to_uppercase();
+    let endpoint = str_arg(args, "endpoint")?;
+    let body     = args.get("body");
+
+    // Token: arg > GITHUB_TOKEN env var
+    let token = args
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| std::env::var("GITHUB_TOKEN").ok())
+        .ok_or_else(|| anyhow::anyhow!(
+            "github_api: no token. Set GITHUB_TOKEN env var or pass \"token\" arg."
+        ))?;
+
+    let url = if endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("https://api.github.com/{}", endpoint.trim_start_matches('/'))
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("do_it-agent/1.0")
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+
+    let mut req = client
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes())
+                .map_err(|_| anyhow::anyhow!("github_api: invalid HTTP method '{method}'"))?,
+            &url,
+        )
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+
+    if let Some(b) = body {
+        req = req.json(b);
+    }
+
+    let resp = req.send().await
+        .map_err(|e| anyhow::anyhow!("github_api: request failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        return Ok(ToolResult {
+            output: format!("GitHub API {status} for {method} {endpoint}:\n{text}"),
+            success: false,
+        });
+    }
+
+    // No body (e.g. 204 No Content on merge)
+    if text.trim().is_empty() {
+        return Ok(ToolResult::ok(format!("{method} {endpoint} → {status}")));
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or(serde_json::Value::String(text.clone()));
+
+    // Smart filtering to keep context window small
+    let output = github_format_response(&json, endpoint, &method);
+
+    Ok(ToolResult::ok(format!("{method} {endpoint} → {status}\n{output}")))
+}
+
+/// Format GitHub API response, filtering noisy fields and decoding file contents.
+fn github_format_response(json: &serde_json::Value, endpoint: &str, method: &str) -> String {
+    // File contents endpoint — decode base64 automatically
+    if endpoint.contains("/contents/") && method == "GET" {
+        if let Some(content_b64) = json.get("content").and_then(|v| v.as_str()) {
+            let decoded = base64_decode_content(content_b64);
+            let name = json.get("name").and_then(|v| v.as_str()).unwrap_or("file");
+            let path = json.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let sha  = json.get("sha").and_then(|v| v.as_str()).unwrap_or("");
+            return format!("File: {path} (sha: {sha})\n\n{decoded}");
+        }
+    }
+
+    match json {
+        // Array response — list of issues, PRs, branches, commits, etc.
+        serde_json::Value::Array(items) => {
+            let filtered: Vec<String> = items.iter().map(|item| {
+                github_summarize_item(item, endpoint)
+            }).collect();
+            format!("{} item(s):\n{}", filtered.len(), filtered.join("\n---\n"))
+        }
+        // Single object — issue, PR, branch, commit details
+        serde_json::Value::Object(_) => {
+            github_summarize_item(json, endpoint)
+        }
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    }
+}
+
+fn github_summarize_item(item: &serde_json::Value, endpoint: &str) -> String {
+    let ep = endpoint.to_ascii_lowercase();
+
+    // Issue or PR
+    if ep.contains("/issues") || ep.contains("/pulls") {
+        let number = item.get("number").and_then(|v| v.as_u64()).map(|n| format!("#{n}")).unwrap_or_default();
+        let title  = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let state  = item.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        let user   = item.get("user").and_then(|u| u.get("login")).and_then(|v| v.as_str()).unwrap_or("");
+        let body   = item.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let body_preview = if body.len() > 400 { format!("{}…", &body[..400]) } else { body.to_string() };
+
+        // PR-specific fields
+        let pr_info = if let Some(head) = item.get("head") {
+            let from = head.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            let into = item.get("base").and_then(|b| b.get("label")).and_then(|v| v.as_str()).unwrap_or("");
+            if !from.is_empty() { format!("\nBranch: {from} → {into}") } else { String::new() }
+        } else { String::new() };
+
+        // Labels
+        let labels: Vec<&str> = item.get("labels")
+            .and_then(|l| l.as_array())
+            .map(|arr| arr.iter().filter_map(|l| l.get("name").and_then(|v| v.as_str())).collect())
+            .unwrap_or_default();
+        let labels_str = if labels.is_empty() { String::new() } else { format!("\nLabels: {}", labels.join(", ")) };
+
+        return format!("{number} [{state}] {title}\nAuthor: @{user}{pr_info}{labels_str}\n{body_preview}");
+    }
+
+    // Commit
+    if ep.contains("/commits") {
+        let sha  = item.get("sha").and_then(|v| v.as_str()).unwrap_or("?");
+        let msg  = item.get("commit").and_then(|c| c.get("message")).and_then(|v| v.as_str()).unwrap_or("");
+        let author = item.get("commit")
+            .and_then(|c| c.get("author"))
+            .and_then(|a| a.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let date = item.get("commit")
+            .and_then(|c| c.get("author"))
+            .and_then(|a| a.get("date"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return format!("{} {} — {} ({})", &sha[..7.min(sha.len())], msg.lines().next().unwrap_or(""), author, date);
+    }
+
+    // Branch
+    if ep.contains("/branches") {
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+        let sha  = item.get("commit").and_then(|c| c.get("sha")).and_then(|v| v.as_str()).unwrap_or("?");
+        let protected = item.get("protected").and_then(|v| v.as_bool()).unwrap_or(false);
+        return format!("{name} ({}) sha:{}", if protected { "protected" } else { "open" }, &sha[..7.min(sha.len())]);
+    }
+
+    // Comment (POST /issues/{n}/comments response)
+    if ep.contains("/comments") {
+        let id   = item.get("id").and_then(|v| v.as_u64()).map(|n| n.to_string()).unwrap_or_default();
+        let user = item.get("user").and_then(|u| u.get("login")).and_then(|v| v.as_str()).unwrap_or("");
+        let body = item.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+        return format!("Comment #{id} by @{user}:\n{body}");
+    }
+
+    // Fallback: just serialize, but strip known noisy fields
+    let mut obj = item.clone();
+    if let serde_json::Value::Object(ref mut map) = obj {
+        for key in &["_links", "reactions", "performed_via_github_app",
+                     "author_association", "node_id", "events_url",
+                     "labels_url", "comments_url", "html_url", "url"] {
+            map.remove(*key);
+        }
+    }
+    serde_json::to_string_pretty(&obj).unwrap_or_default()
+}
+
+fn base64_decode_content(b64: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    // GitHub wraps lines with \n — strip them
+    let cleaned: String = b64.chars().filter(|&c| c != '\n' && c != '\r').collect();
+    STANDARD.decode(cleaned.as_bytes())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| format!("[binary content, {} bytes base64]", b64.len()))
+}
+
+// ─── test_coverage ────────────────────────────────────────────────────────────
+
+/// Run tests and collect coverage information.
+/// Detects the project type and uses the appropriate tool.
+///
+/// Supported:
+///   Rust   — cargo tarpaulin (if installed) or cargo test with --doc
+///   Node   — jest --coverage (if jest config found)
+///   Python — pytest --cov (if pytest-cov installed)
+///
+/// Args:
+///   dir?       — directory to run in (default: repo root)
+///   threshold? — warn if line coverage is below this % (default: 80)
+async fn test_coverage(args: &Value, root: &Path) -> Result<ToolResult> {
+    let cwd = if let Some(p) = args.get("dir").and_then(|v| v.as_str()) {
+        resolve(root, p)?
+    } else {
+        root.to_path_buf()
+    };
+    let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(80.0);
+
+    // Detect project type by looking for manifest files
+    let is_rust   = cwd.join("Cargo.toml").exists();
+    let is_node   = cwd.join("package.json").exists();
+    let is_python = cwd.join("pyproject.toml").exists()
+        || cwd.join("setup.py").exists()
+        || cwd.join("setup.cfg").exists();
+
+    if is_rust {
+        run_coverage_rust(&cwd, threshold).await
+    } else if is_node {
+        run_coverage_node(&cwd, threshold).await
+    } else if is_python {
+        run_coverage_python(&cwd, threshold).await
+    } else {
+        Ok(ToolResult {
+            output: format!(
+                "test_coverage: could not detect project type in {}.\n\
+                Expected Cargo.toml (Rust), package.json (Node), or pyproject.toml/setup.py (Python).",
+                cwd.display()
+            ),
+            success: false,
+        })
+    }
+}
+
+async fn run_coverage_rust(cwd: &Path, threshold: f64) -> Result<ToolResult> {
+    // Try cargo tarpaulin first
+    let tarpaulin = tokio::process::Command::new("cargo")
+        .args(["tarpaulin", "--out", "Stdout", "--skip-clean"])
+        .current_dir(cwd)
+        .output()
+        .await;
+
+    match tarpaulin {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let combined = format!("{stdout}{stderr}");
+
+            // Parse coverage % from tarpaulin output: "X.XX% coverage"
+            let coverage = parse_coverage_percent(&combined);
+            let summary = format_coverage_summary("cargo tarpaulin", &combined, coverage, threshold);
+            Ok(ToolResult { output: summary, success: coverage.map(|c| c >= threshold).unwrap_or(true) })
+        }
+        _ => {
+            // Fall back to cargo test — no coverage numbers but at least tests run
+            let out = tokio::process::Command::new("cargo")
+                .args(["test", "--", "--test-output", "immediate"])
+                .current_dir(cwd)
+                .output()
+                .await
+                .map_err(|e| anyhow::anyhow!("test_coverage: cargo test failed to start: {e}"))?;
+
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let combined = format!("{stdout}{stderr}");
+            let success = out.status.success();
+
+            Ok(ToolResult {
+                output: format!(
+                    "cargo tarpaulin not found — ran cargo test instead (no coverage %)\n\
+                    Install: cargo install cargo-tarpaulin\n\n{combined}"
+                ),
+                success,
+            })
+        }
+    }
+}
+
+async fn run_coverage_node(cwd: &Path, threshold: f64) -> Result<ToolResult> {
+    let out = tokio::process::Command::new("npx")
+        .args(["jest", "--coverage", "--coverageReporters=text"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("test_coverage: npx jest failed to start: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let coverage = parse_coverage_percent(&combined);
+    let summary = format_coverage_summary("jest --coverage", &combined, coverage, threshold);
+    Ok(ToolResult { output: summary, success: out.status.success() })
+}
+
+async fn run_coverage_python(cwd: &Path, threshold: f64) -> Result<ToolResult> {
+    let out = tokio::process::Command::new("python3")
+        .args(["-m", "pytest", "--cov", "--cov-report=term-missing", "-q"])
+        .current_dir(cwd)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("test_coverage: pytest failed to start: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let coverage = parse_coverage_percent(&combined);
+    let summary = format_coverage_summary("pytest --cov", &combined, coverage, threshold);
+    Ok(ToolResult { output: summary, success: out.status.success() })
+}
+
+fn parse_coverage_percent(output: &str) -> Option<f64> {
+    // Matches patterns like "85.23% coverage", "TOTAL ... 85%", "Lines covered: 85.2%"
+    let re = regex::Regex::new(r"(\d+\.?\d*)\s*%").ok()?;
+    // Find the last percentage that looks like a total (largest number usually)
+    re.captures_iter(output)
+        .filter_map(|c| c[1].parse::<f64>().ok())
+        .filter(|&p| p <= 100.0)
+        .last()
+}
+
+fn format_coverage_summary(tool: &str, raw: &str, coverage: Option<f64>, threshold: f64) -> String {
+    let coverage_line = match coverage {
+        Some(c) => {
+            let status = if c >= threshold { "✓" } else { "⚠ BELOW THRESHOLD" };
+            format!("Coverage: {:.1}% {status} (threshold: {threshold:.0}%)", c)
+        }
+        None => "Coverage: could not parse percentage from output".to_string(),
+    };
+
+    // Show last 50 lines of output (most relevant part)
+    let lines: Vec<&str> = raw.lines().collect();
+    let tail = if lines.len() > 50 {
+        format!("[... {} lines truncated ...]\n{}", lines.len() - 50, lines[lines.len()-50..].join("\n"))
+    } else {
+        raw.to_string()
+    };
+
+    format!("Tool: {tool}\n{coverage_line}\n\n{tail}")
+}
+
+// ─── notify ───────────────────────────────────────────────────────────────────
+
+/// Send a one-way notification via Telegram (no waiting for reply).
+/// Use for progress updates, completion notices, or alerts during long runs.
+/// Falls back to printing to stdout if Telegram is not configured.
+///
+/// Args:
+///   message  — text to send
+///   silent?  — if true, sends without sound (default: false)
+async fn notify(args: &Value, tg: &TelegramConfig) -> Result<ToolResult> {
+    let message = str_arg(args, "message")?;
+    let silent  = args.get("silent").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if let (Some(token), Some(chat_id)) = (&tg.token, &tg.chat_id) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": chat_id,
+                "text": format!("🤖 {message}"),
+                "disable_notification": silent,
+            }))
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                return Ok(ToolResult::ok(format!("Notification sent: {message}")));
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                tracing::warn!("notify: Telegram returned {status}: {body}");
+                // Fall through to stdout
+            }
+            Err(e) => {
+                tracing::warn!("notify: Telegram unreachable: {e}");
+                // Fall through to stdout
+            }
+        }
+    }
+
+    // Stdout fallback
+    println!("\n📢 AGENT NOTIFICATION: {message}\n");
+    Ok(ToolResult::ok(format!("Notification (stdout): {message}")))
 }

@@ -24,6 +24,18 @@ impl History {
         self.turns.push(turn);
     }
 
+    /// Return the last `n` turns (excluding step-0 memory injections).
+    pub fn recent_turns(&self, n: usize) -> Vec<&Turn> {
+        self.turns.iter()
+            .filter(|t| t.step > 0)
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
+
     /// Format history for injection into the LLM prompt.
     /// - Turns older than `window` are collapsed to one-liners.
     /// - Recent `window` turns are shown in full.

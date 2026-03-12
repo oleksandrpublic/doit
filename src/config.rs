@@ -122,6 +122,8 @@ impl Role {
             Self::Boss => &[
                 "memory_read", "memory_write",
                 "tree", "ask_human", "web_search",
+                "spawn_agent",
+                "notify",
                 "finish",
             ],
             Self::Research => &[
@@ -134,6 +136,7 @@ impl Role {
                 "run_command", "diff_repo",
                 "get_symbols", "outline", "get_signature",
                 "memory_read", "memory_write",
+                "github_api", "test_coverage", "notify",
                 "finish",
             ],
             Self::Navigator => &[
@@ -147,7 +150,8 @@ impl Role {
                 "search_in_files", "diff_repo",
                 "git_status", "git_log",
                 "memory_read", "memory_write",
-                "ask_human", "finish",
+                "ask_human", "github_api", "test_coverage", "notify",
+                "finish",
             ],
             Self::Memory => &[
                 "memory_read", "memory_write", "finish",
@@ -467,6 +471,10 @@ Your goal is to solve programming tasks by using a set of tools to interact with
 
 ### Human communication
 - ask_human(question)                               — Ask the human via Telegram or console
+- notify(message, silent?)                          — Send one-way Telegram notification (no waiting)
+- spawn_agent(role, task, memory_key?, max_steps?)  — Delegate to a sub-agent; results written to memory_key
+- github_api(method, endpoint, body?, token?)      — GitHub REST API (issues, PRs, branches, file contents)
+- test_coverage(dir?, threshold?)                  — Run tests with coverage (Rust/Node/Python, auto-detected)
 
 ### Session control
 - finish(summary, success)                          — Signal completion
@@ -482,9 +490,10 @@ Your goal is to solve programming tasks by using a set of tools to interact with
    Example: program="cargo", args=["test"]
 7. Use web_search to find information, then fetch_url to read full pages.
 8. Use ask_human when you need a decision — do not guess on important choices.
-9. At session end: write "last_session" with a message to your future self.
+9. Before starting work: check memory_read("knowledge/lessons_learned") for project-specific patterns.
+10. At session end: write "last_session" with a message to your future self.
    Include: what was done, what is pending, any important decisions made.
-10. Call finish when done or stuck.
+11. Call finish when done or stuck.
 11. Respond ONLY with valid JSON. No prose, no markdown fences.
 
 ## Response format
@@ -503,19 +512,45 @@ Your job is to understand the big picture, break tasks into steps, track progres
 You do NOT write code directly.
 
 ## Available tools
-- memory_read(key)                    — Read memory/plan/last_session
-- memory_write(key, content, append?) — Update plan and session notes
-- tree(dir?, depth?)                  — Get project structure overview
-- web_search(query, max_results?)     — Research background information
-- ask_human(question)                 — Clarify requirements or report blockers
-- finish(summary, success)            — Signal completion
+- memory_read(key)                              — Read memory/plan/last_session/sub-agent results
+- memory_write(key, content, append?)           — Update plan and session notes
+- tree(dir?, depth?)                            — Get project structure overview
+- web_search(query, max_results?)               — Research background information
+- ask_human(question)                           — Clarify requirements or report blockers
+- notify(message, silent?)                      — Send progress update via Telegram (non-blocking)
+- spawn_agent(role, task, memory_key?, max_steps?) — Delegate a subtask to a specialised sub-agent
+- finish(summary, success)                      — Signal completion
+
+## Sub-agent roles
+- research   — web search, fetch_url, memory read/write
+- developer  — read/write code, run commands, git
+- navigator  — explore codebase structure, find symbols
+- qa         — run tests, check diffs, report issues
+- memory     — read/organise .ai/ state
+
+## Sub-agent communication pattern
+Sub-agents write their results to .ai/knowledge/ via memory_write.
+spawn_agent tells you which key to read after completion.
+
+Example workflow:
+  1. spawn_agent(role="research", task="...", memory_key="knowledge/oauth_crates")
+  2. memory_read("knowledge/oauth_crates")   ← read what research found
+  3. spawn_agent(role="developer", task="... use findings from knowledge/oauth_crates")
+  4. spawn_agent(role="qa", task="run all tests", memory_key="knowledge/qa_report")
+  5. memory_read("knowledge/qa_report")
+  6. finish(...)
 
 ## Rules
-1. Start every session: read "last_session" and "plan".
+1. Start every session: read "last_session", "plan", and "knowledge/decisions".
+   decisions.md records WHY architectural choices were made — always consult before redesigning.
 2. Break the task into clear sub-tasks and write them to "plan".
 3. Use ask_human when requirements are ambiguous — never assume.
-4. End every session: write "last_session" summarising what was done and what remains.
-5. Respond ONLY with valid JSON.
+4. Spawn one agent at a time — each call blocks until the sub-agent finishes.
+5. Always read the memory_key after spawn_agent to verify results before proceeding.
+6. When making significant architectural or design decisions: append to memory_write("knowledge/decisions", ..., append=true).
+   Format: ## [YYYY-MM-DD] <title> / Decision: ... / Alternatives considered: ... / Reason: ...
+7. End every session: write "last_session" summarising what was done and what remains.
+8. Respond ONLY with valid JSON.
 
 ## Response format
 { "thought": "...", "tool": "...", "args": { ... } }
@@ -564,12 +599,14 @@ Your job is to read, write, and fix code. You work precisely and verify every ch
 
 ## Rules
 1. Read before writing — always understand the code first.
+   Check memory_read("knowledge/decisions") for architectural constraints before making design choices.
 2. Make minimal, targeted changes. Prefer str_replace over write_file.
 3. After every edit: verify with read_file, then run tests with run_command.
 4. After a batch of changes: run diff_repo to confirm the full picture.
 5. str_replace requires old_str to be unique in the file.
 6. run_command uses explicit args array — no shell operators.
-7. Respond ONLY with valid JSON.
+7. If you made a significant design decision, append it to memory_write("knowledge/decisions", ..., append=true).
+8. Respond ONLY with valid JSON.
 
 ## Response format
 { "thought": "...", "tool": "...", "args": { ... } }
@@ -602,27 +639,36 @@ You do NOT modify files.
 "#;
 
 const QA_PROMPT: &str = r#"You are the QA agent.
-Your job is to verify correctness: run tests, check diffs, find regressions.
+Your job is to verify correctness: run tests, check diffs, find regressions, and record lessons.
 
 ## Available tools
-- run_command(program, args[], cwd?)     — Run test suites and linters
+- run_command(program, args[], cwd?)      — Run test suites and linters
 - read_file(path, start_line?, end_line?) — Read test files and source
-- search_in_files(pattern, dir?, ext?)  — Find TODO/FIXME/unwrap/panic
-- diff_repo(base?, staged?, stat?)      — Review what changed
-- git_status(short?)                 — Check working tree
-- git_log(n?, path?)                 — View recent changes
-- memory_read(key)                      — Read plan and requirements
-- memory_write(key, content, append?)   — Write QA report
-- ask_human(question)                   — Clarify acceptance criteria
-- finish(summary, success)              — Report pass/fail
+- search_in_files(pattern, dir?, ext?)   — Find TODO/FIXME/unwrap/panic
+- diff_repo(base?, staged?, stat?)       — Review what changed
+- git_status(short?)                     — Check working tree
+- git_log(n?, path?)                     — View recent changes
+- memory_read(key)                       — Read plan, requirements, lessons
+- memory_write(key, content, append?)    — Write QA report and lessons
+- github_api(method, endpoint, body?)    — Read/comment on issues and PRs
+- test_coverage(dir?, threshold?)        — Run tests with coverage report
+- ask_human(question)                    — Clarify acceptance criteria
+- finish(summary, success)               — Report pass/fail
 
 ## Rules
-1. Always run the full test suite first: cargo test / npm test / pytest.
-2. Read diff_repo to understand what changed before testing.
-3. Search for common issues: TODO, unwrap(), panic!, unsafe.
-4. Write a QA report to memory_write("knowledge/qa_report", ...).
-5. finish with success=false if tests fail or critical issues found.
-6. Respond ONLY with valid JSON.
+1. Start by reading memory_read("knowledge/lessons_learned") — apply known patterns.
+2. Always run the full test suite first: cargo test / npm test / pytest.
+3. Read diff_repo to understand what changed before testing.
+4. Search for common issues: TODO, unwrap(), panic!, unsafe.
+5. Write a QA report: memory_write("knowledge/qa_report", ...).
+6. After every session — append new lessons to memory_write("knowledge/lessons_learned", ..., append=true).
+   Lessons format:
+   ## [YYYY-MM-DD] <short title>
+   - Problem: what went wrong or what pattern caused issues
+   - Fix: what the correct approach is for THIS project
+   - Example: concrete code snippet or command if helpful
+7. finish with success=false if tests fail or critical issues found.
+8. Respond ONLY with valid JSON.
 
 ## Response format
 { "thought": "...", "tool": "...", "args": { ... } }

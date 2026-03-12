@@ -17,6 +17,8 @@ pub struct SweAgent {
     system_prompt: String,
     tg: TelegramConfig,
     role: Role,
+    /// Stored so sub-agents can inherit connection settings
+    cfg_snapshot: AgentConfig,
 }
 
 impl SweAgent {
@@ -37,18 +39,19 @@ impl SweAgent {
 
         Ok(Self {
             llm,
-            default_model: cfg.model,
-            router: cfg.models,
+            default_model: cfg.model.clone(),
+            router: cfg.models.clone(),
             root,
             history: History::new(cfg.history_window),
             max_steps,
             max_output_chars: cfg.max_output_chars,
             system_prompt,
             tg: TelegramConfig {
-                token: cfg.telegram_token,
-                chat_id: cfg.telegram_chat_id,
+                token: cfg.telegram_token.clone(),
+                chat_id: cfg.telegram_chat_id.clone(),
             },
             role,
+            cfg_snapshot: cfg,
         })
     }
 
@@ -162,6 +165,45 @@ impl SweAgent {
         Ok(())
     }
 
+    /// Run as a sub-agent: no banner, returns the finish summary as a string.
+    /// Called from spawn_agent tool.
+    pub async fn run_capture(&mut self, task: &str) -> Result<String> {
+        println!("  [sub-agent: {}] task: {}", self.role.name(), task);
+
+        self.session_init();
+
+        for step in 1..=self.max_steps {
+            match self.step(task, step).await {
+                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::Finished { summary, success }) => {
+                    println!(
+                        "  [sub-agent: {}] finished (success={success}): {}",
+                        self.role.name(),
+                        summary.lines().next().unwrap_or("(no summary)")
+                    );
+                    return Ok(summary);
+                }
+                Err(e) => {
+                    tracing::error!("[sub-agent] step {step} error: {e}");
+                    self.history.push(Turn {
+                        step,
+                        thought: "(error recovery)".to_string(),
+                        tool: "error".to_string(),
+                        args: serde_json::Value::Null,
+                        output: format!("ERROR: {e}"),
+                        success: false,
+                    });
+                }
+            }
+        }
+
+        Ok(format!(
+            "[sub-agent: {}] reached max_steps ({}) without finishing",
+            self.role.name(),
+            self.max_steps
+        ))
+    }
+
     async fn step(&mut self, task: &str, step: usize) -> Result<StepOutcome> {
         let thinking_model = self.router.resolve(&ModelRole::Thinking, &self.default_model);
         let user_message = self.build_prompt(task, step);
@@ -215,6 +257,8 @@ impl SweAgent {
             &self.root,
             self.max_output_chars,
             &self.tg,
+            &self.cfg_snapshot,
+            self.max_steps / 2,
         )
         .await?;
 
@@ -230,19 +274,82 @@ impl SweAgent {
 
         self.history.push(Turn {
             step,
-            thought: action.thought,
-            tool: action.tool,
-            args: action.args,
-            output: result.output,
+            thought: action.thought.clone(),
+            tool: action.tool.clone(),
+            args: action.args.clone(),
+            output: result.output.clone(),
             success: result.success,
         });
+
+        // Loop detection: check for repeated failures or stuck tool calls
+        if let Some(alert) = self.detect_loop(step) {
+            tracing::warn!("Loop detected: {alert}");
+            // Send notification if Telegram configured
+            let _ = tools::dispatch(
+                "notify",
+                &serde_json::json!({ "message": alert }),
+                &self.root,
+                self.max_output_chars,
+                &self.tg,
+                &self.cfg_snapshot,
+                self.max_steps / 2,
+            ).await;
+        }
 
         Ok(StepOutcome::Continue)
     }
 
+    /// Detect if the agent is stuck in a loop.
+    /// Returns Some(alert_message) if a loop pattern is detected.
+    fn detect_loop(&self, current_step: usize) -> Option<String> {
+        // Need at least 4 turns to detect a pattern
+        let turns = self.history.recent_turns(4);
+        if turns.len() < 4 {
+            return None;
+        }
+
+        // Pattern 1: same tool failing 3 times in a row
+        let last3: Vec<_> = turns.iter().rev().take(3).collect();
+        if last3.len() == 3
+            && last3.iter().all(|t| !t.success)
+            && last3.iter().all(|t| t.tool == last3[0].tool)
+        {
+            return Some(format!(
+                "Agent stuck: tool '{}' failed 3 times in a row (step {}). Task may need human input.",
+                last3[0].tool, current_step
+            ));
+        }
+
+        // Pattern 2: exact same tool + first arg repeated 4 times in a row
+        let last4: Vec<_> = turns.iter().rev().take(4).collect();
+        if last4.len() == 4 && last4.iter().all(|t| t.tool == last4[0].tool) {
+            let first_args: Vec<String> = last4
+                .iter()
+                .map(|t| {
+                    t.args.as_object()
+                        .and_then(|m| m.values().next())
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect()
+                })
+                .collect();
+            if first_args.windows(2).all(|w| w[0] == w[1]) {
+                return Some(format!(
+                    "Agent looping: '{}' called with same args 4 times in a row (step {}).",
+                    last4[0].tool, current_step
+                ));
+            }
+        }
+
+        None
+    }
+
     /// Called once at session start.
     /// - Increments .ai/state/session_counter.txt
-    /// - Reads .ai/state/last_session.md and injects it into history as step 0
+    /// - Reads .ai/state/last_session.md and injects as step 0
+    /// - Reads .ai/state/external_messages.md, injects as step 0 and clears the file
     fn session_init(&mut self) {
         let ai_state = self.root.join(".ai/state");
         let _ = std::fs::create_dir_all(&ai_state);
@@ -271,6 +378,100 @@ impl SweAgent {
                 });
             }
         }
+
+        // Inject external_messages and clear the file so they are not shown twice
+        let ext_path = ai_state.join("external_messages.md");
+        if let Ok(content) = std::fs::read_to_string(&ext_path) {
+            if !content.trim().is_empty() {
+                let line_count = content.lines().count();
+                println!("  [inbox] {line_count} external message(s) received");
+                self.history.push(Turn {
+                    step: 0,
+                    thought: "Reading external messages received since last session".to_string(),
+                    tool: "memory_read".to_string(),
+                    args: serde_json::json!({ "key": "external" }),
+                    output: format!("## External messages
+{content}"),
+                    success: true,
+                });
+                // Clear the file — messages are now in history
+                let _ = std::fs::write(&ext_path, "");
+            }
+        }
+
+        // Inject .ai/project.toml if it exists, or scaffold it on first run
+        self.init_project_config();
+    }
+
+    /// Read or scaffold .ai/project.toml.
+    fn init_project_config(&mut self) {
+        let project_toml = self.root.join(".ai/project.toml");
+
+        if project_toml.exists() {
+            if let Ok(content) = std::fs::read_to_string(&project_toml) {
+                if !content.trim().is_empty() {
+                    self.history.push(Turn {
+                        step: 0,
+                        thought: "Loading project configuration".to_string(),
+                        tool: "memory_read".to_string(),
+                        args: serde_json::json!({ "key": "project_config" }),
+                        output: format!("## Project configuration (.ai/project.toml)\n{content}"),
+                        success: true,
+                    });
+                }
+            }
+            return;
+        }
+
+        // First run — scaffold from filesystem hints
+        let template = self.scaffold_project_toml();
+        let _ = std::fs::write(&project_toml, &template);
+        println!("  [project] Created .ai/project.toml — review and edit as needed");
+
+        self.history.push(Turn {
+            step: 0,
+            thought: "Scaffolded project configuration on first run".to_string(),
+            tool: "memory_read".to_string(),
+            args: serde_json::json!({ "key": "project_config" }),
+            output: format!("## Project configuration (.ai/project.toml) — just created\n{template}"),
+            success: true,
+        });
+    }
+
+    /// Detect project type and generate a starter .ai/project.toml.
+    fn scaffold_project_toml(&self) -> String {
+        let root = &self.root;
+
+        let is_rust   = root.join("Cargo.toml").exists();
+        let is_node   = root.join("package.json").exists();
+        let is_python = root.join("pyproject.toml").exists() || root.join("setup.py").exists();
+        let is_go     = root.join("go.mod").exists();
+
+        let project_name = detect_project_name(root)
+            .unwrap_or_else(|| root.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string());
+
+        let (language, test_cmd, build_cmd, lint_cmd) = if is_rust {
+            ("rust", "cargo test", "cargo build --release", "cargo clippy -- -D warnings")
+        } else if is_node {
+            ("typescript", "npm test", "npm run build", "npx eslint src/")
+        } else if is_python {
+            ("python", "pytest", "python -m build", "ruff check .")
+        } else if is_go {
+            ("go", "go test ./...", "go build ./...", "golangci-lint run")
+        } else {
+            ("unknown", "# set test command", "# set build command", "# set lint command")
+        };
+
+        let github_repo = detect_github_repo(root).unwrap_or_else(|| "owner/repo".to_string());
+
+        format!(
+            "[project]\nname        = \"{project_name}\"\nlanguage    = \"{language}\"\ndescription = \"# TODO: short description\"\n\n\
+             [commands]\ntest  = \"{test_cmd}\"\nbuild = \"{build_cmd}\"\nlint  = \"{lint_cmd}\"\n\n\
+             [github]\nrepo = \"{github_repo}\"\n# default_branch = \"main\"\n\n\
+             [agent]\n# Project-specific conventions for the agent.\nnotes = \"\"\"\n\
+             - TODO: add project-specific conventions here\n\
+             \"\"\"\n"
+        )
     }
 
     fn build_prompt(&self, task: &str, step: usize) -> String {
@@ -324,4 +525,49 @@ fn first_line(s: &str, max: usize) -> String {
 enum StepOutcome {
     Continue,
     Finished { summary: String, success: bool },
+}
+
+// ─── Project detection helpers ────────────────────────────────────────────────
+
+fn detect_project_name(root: &std::path::Path) -> Option<String> {
+    // Try Cargo.toml first
+    if let Ok(s) = std::fs::read_to_string(root.join("Cargo.toml")) {
+        for line in s.lines() {
+            let line = line.trim();
+            if line.starts_with("name") {
+                if let Some(val) = line.splitn(2, '=').nth(1) {
+                    return Some(val.trim().trim_matches('"').to_string());
+                }
+            }
+        }
+    }
+    // Try package.json
+    if let Ok(s) = std::fs::read_to_string(root.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&s) {
+            if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn detect_github_repo(root: &std::path::Path) -> Option<String> {
+    let config = std::fs::read_to_string(root.join(".git/config")).ok()?;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with("url =") {
+            let url = line.splitn(2, '=').nth(1)?.trim();
+            // https://github.com/owner/repo.git  or  git@github.com:owner/repo.git
+            let repo = if let Some(rest) = url.strip_prefix("https://github.com/") {
+                rest.trim_end_matches(".git")
+            } else if let Some(rest) = url.strip_prefix("git@github.com:") {
+                rest.trim_end_matches(".git")
+            } else {
+                continue;
+            };
+            return Some(repo.to_string());
+        }
+    }
+    None
 }
