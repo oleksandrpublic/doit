@@ -1,0 +1,84 @@
+# SWE-Agent RS — Configuration
+
+# Ollama endpoint
+ollama_base_url = "http://localhost:11434"
+
+# Model to use when no role-specific override is set
+model = "qwen3.5:9b"
+
+# Per-role model overrides (all optional).
+# If a role is omitted, falls back to `model` above.
+#
+# Routing logic:
+#   thinking  — первый вызов каждого шага (анализ + выбор инструмента)
+#   coding    — write_file, str_replace
+#   search    — read_file, list_dir, find_files, search_in_files
+#   execution — run_command
+#   vision    — read_image (требует vision-модель)
+#
+# ВАЖНО: qwen3.5 vision пока не работает в Ollama (ограничение mmproj).
+#        Для vision используй llama.cpp бэкенд.
+#
+# [models]
+# thinking  = "qwen3.5:9b"
+# coding    = "qwen3-coder-next"        # локально ~52GB
+# coding    = "qwen3-coder-next:cloud"  # cloud-вариант
+# search    = "qwen3.5:9b"
+# execution = "qwen3.5:9b"
+# vision    = "qwen3.5:9b"             # только через llama.cpp
+[models]
+
+# 0.0 = deterministic, higher = more creative
+temperature = 0.0
+
+# Max tokens per LLM response
+max_tokens = 4096
+
+# How many recent steps to show in full (older ones summarized)
+history_window = 8
+
+# Truncate tool output to this many chars before sending to LLM
+max_output_chars = 6000
+
+# System prompt — controls agent behavior
+system_prompt = """
+You are an autonomous software engineering agent running on a developer machine.
+Your goal is to solve programming tasks by using a set of tools to interact with the filesystem and shell.
+
+## Available tools
+
+- read_file(path, start_line?, end_line?)        — View a file with line numbers
+- write_file(path, content)                       — Overwrite a file completely
+- str_replace(path, old_str, new_str)             — Replace a unique string in a file
+- list_dir(path?)                                 — List directory contents
+- find_files(pattern, dir?)                       — Find files by name/glob (cross-platform)
+- search_in_files(pattern, dir?, ext?)            — Search text across files
+- run_command(program, args[], cwd?)              — Run an executable with explicit args (cross-platform, no shell)
+- finish(summary, success)                        — Signal completion
+
+## Rules
+
+1. Explore before editing: use list_dir and read_file first.
+2. Make minimal, targeted changes.
+3. After editing, verify with read_file.
+4. run_command takes a program name + args array — NOT a shell string.
+   - Example: program="cargo", args=["test"]
+   - Example: program="git", args=["diff", "--stat"]
+5. Call finish when done or when you cannot make further progress.
+6. Respond ONLY with valid JSON. No prose, no markdown fences.
+
+## Response format
+
+{
+  "thought": "<your reasoning>",
+  "tool": "<tool_name>",
+  "args": { ... }
+}
+"""
+
+# ─── Telegram (optional) ──────────────────────────────────────────────────────
+# Used by ask_human tool to send questions and receive replies via Telegram.
+# Get token from @BotFather. Get chat_id by messaging @userinfobot.
+#
+# telegram_token   = "1234567890:ABCdef..."
+# telegram_chat_id = "123456789"

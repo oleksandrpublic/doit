@@ -1,0 +1,54 @@
+[package]
+name        = "do_it"
+version     = "0.2.0"
+edition     = "2024"
+authors     = [
+    "Claude Sonnet 4.6 <claude@anthropic.com>",
+    "Oleksandr <oleksandr.public@gmail.com>",
+]
+description = "Autonomous coding agent powered by local LLMs via Ollama. Cross-platform, no shell dependency, no cloud APIs required."
+repository  = "https://github.com/oleksandrpublic/doit"
+homepage    = "https://github.com/oleksandrpublic/doit"
+documentation = "https://github.com/oleksandrpublic/doit/blob/main/DOCS.md"
+readme      = "README.md"
+license     = "MIT"
+keywords    = ["agent", "llm", "ollama", "automation", "coding"]
+categories  = ["command-line-utilities", "development-tools"]
+exclude     = [".ai/", "tasks/", "*.png", "*.jpg"]
+
+[[bin]]
+name = "do_it"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP — Ollama API, web_search, fetch_url, Telegram
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Config file (TOML)
+toml = "0.8"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+
+# Logging / tracing
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Filesystem traversal (find_files, search_in_files, find_references, tree)
+walkdir = "2"
+
+# Regex (search_in_files, find_references, AST parsers)
+regex = "1"
+
+# Base64 encoding for vision (image → Ollama)
+base64 = "0.22"
