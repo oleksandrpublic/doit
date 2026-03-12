@@ -562,6 +562,7 @@ fn detect_github_repo(root: &std::path::Path) -> Option<String> {
         let line = line.trim();
         if line.starts_with("url =") {
             let url = line.splitn(2, '=').nth(1)?.trim();
+
             // https://github.com/owner/repo.git  or  git@github.com:owner/repo.git
             let repo = if let Some(rest) = url.strip_prefix("https://github.com/") {
                 rest.trim_end_matches(".git")
@@ -574,4 +575,141 @@ fn detect_github_repo(root: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_action ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_action_clean_json() {
+        let raw = r#"{"thought":"looking","tool":"read_file","args":{"path":"src/main.rs"}}"#;
+        let a = parse_action(raw).unwrap();
+        assert_eq!(a.tool, "read_file");
+        assert_eq!(a.thought, "looking");
+    }
+
+    #[test]
+    fn parse_action_strips_json_fence() {
+        let raw = "```json\n{\"thought\":\"x\",\"tool\":\"finish\",\"args\":{\"summary\":\"done\",\"success\":true}}\n```";
+        let a = parse_action(raw).unwrap();
+        assert_eq!(a.tool, "finish");
+    }
+
+    #[test]
+    fn parse_action_strips_plain_fence() {
+        let raw = "```\n{\"thought\":\"x\",\"tool\":\"tree\",\"args\":{}}\n```";
+        let a = parse_action(raw).unwrap();
+        assert_eq!(a.tool, "tree");
+    }
+
+    #[test]
+    fn parse_action_prose_before_json() {
+        // Qwen и другие модели иногда добавляют текст перед JSON
+        let raw = "Sure, here is my response:\n{\"thought\":\"x\",\"tool\":\"tree\",\"args\":{}}";
+        let a = parse_action(raw).unwrap();
+        assert_eq!(a.tool, "tree");
+    }
+
+    #[test]
+    fn parse_action_prose_after_json() {
+        let raw = "{\"thought\":\"x\",\"tool\":\"tree\",\"args\":{}}\nHope that helps!";
+        let a = parse_action(raw).unwrap();
+        assert_eq!(a.tool, "tree");
+    }
+
+    #[test]
+    fn parse_action_no_json_is_err() {
+        assert!(parse_action("I will now read the file.").is_err());
+    }
+
+    #[test]
+    fn parse_action_unclosed_json_is_err() {
+        assert!(parse_action("{\"thought\":\"x\",\"tool\":\"read_file\"").is_err());
+    }
+
+    #[test]
+    fn parse_action_empty_is_err() {
+        assert!(parse_action("").is_err());
+    }
+
+    // ── strip_fences ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_fences_json_fence() {
+        assert_eq!(strip_fences("```json\n{}\n```"), "{}");
+    }
+
+    #[test]
+    fn strip_fences_plain_fence() {
+        assert_eq!(strip_fences("```\n{}\n```"), "{}");
+    }
+
+    #[test]
+    fn strip_fences_no_fence_passthrough() {
+        assert_eq!(strip_fences("{}"), "{}");
+    }
+
+    // ── first_line ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn first_line_truncates_long() {
+        let s = "a".repeat(200);
+        let out = first_line(&s, 80);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.len(), 83);
+    }
+
+    #[test]
+    fn first_line_takes_first_of_multiline() {
+        assert_eq!(first_line("foo\nbar\nbaz", 100), "foo");
+    }
+
+    #[test]
+    fn first_line_short_passthrough() {
+        assert_eq!(first_line("hello", 100), "hello");
+    }
+
+    #[test]
+    fn first_line_empty() {
+        assert_eq!(first_line("", 100), "");
+    }
+
+    // ── detect_project_name ──────────────────────────────────────────────────
+
+    #[test]
+    fn detect_project_name_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my_crate\"\nversion = \"0.1.0\"\n",
+        ).unwrap();
+        assert_eq!(detect_project_name(dir.path()), Some("my_crate".to_string()));
+    }
+
+    #[test]
+    fn detect_project_name_package_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name": "my-app", "version": "1.0.0"}"#,
+        ).unwrap();
+        assert_eq!(detect_project_name(dir.path()), Some("my-app".to_string()));
+    }
+
+    #[test]
+    fn detect_project_name_prefers_cargo_over_npm() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"rust_name\"\n").unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"name": "npm_name"}"#).unwrap();
+        assert_eq!(detect_project_name(dir.path()), Some("rust_name".to_string()));
+    }
+
+    #[test]
+    fn detect_project_name_none_if_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(detect_project_name(dir.path()), None);
+    }
 }

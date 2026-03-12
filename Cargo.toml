@@ -52,3 +52,6 @@ regex = "1"
 
 # Base64 encoding for vision (image → Ollama)
 base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"

@@ -2042,13 +2042,12 @@ async fn git_stash(args: &Value, root: &Path) -> Result<ToolResult> {
 ///   memory_key? — .ai/knowledge/ key where sub-agent should write results
 ///                 (default: "knowledge/<role>_result")
 ///   max_steps?  — override max steps (default: parent_sub_steps, min 5)
-fn spawn_agent<'a>(
-    args: &'a Value,
-    root: &'a Path,
-    cfg: &'a crate::config::AgentConfig,
+async fn spawn_agent(
+    args: &Value,
+    root: &Path,
+    cfg: &crate::config::AgentConfig,
     parent_sub_steps: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + 'a>> {
-    Box::pin(async move {
+) -> Result<ToolResult> {
     use crate::agent::SweAgent;
     use crate::config::Role;
 
@@ -2104,7 +2103,6 @@ fn spawn_agent<'a>(
         role.name(),
         memory_key = memory_key,
     )))
-    })
 }
 
 // ─── github_api ───────────────────────────────────────────────────────────────
@@ -2515,4 +2513,523 @@ async fn notify(args: &Value, tg: &TelegramConfig) -> Result<ToolResult> {
     // Stdout fallback
     println!("\n📢 AGENT NOTIFICATION: {message}\n");
     Ok(ToolResult::ok(format!("Notification (stdout): {message}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ── resolve_memory_path ──────────────────────────────────────────────────
+
+    #[test]
+    fn memory_path_named_keys() {
+        let root = std::path::Path::new("/repo");
+        assert!(resolve_memory_path(root, "plan").to_string_lossy().ends_with("state/current_plan.md"));
+        assert!(resolve_memory_path(root, "last_session").to_string_lossy().ends_with("state/last_session.md"));
+        assert!(resolve_memory_path(root, "session_counter").to_string_lossy().ends_with("state/session_counter.txt"));
+        assert!(resolve_memory_path(root, "external").to_string_lossy().ends_with("state/external_messages.md"));
+        assert!(resolve_memory_path(root, "history").to_string_lossy().ends_with("logs/history.md"));
+    }
+
+    #[test]
+    fn memory_path_bare_key_goes_to_knowledge() {
+        let root = std::path::Path::new("/repo");
+        let p = resolve_memory_path(root, "my_notes");
+        assert!(p.to_string_lossy().ends_with("knowledge/my_notes.md"));
+    }
+
+    #[test]
+    fn memory_path_explicit_subpath() {
+        let root = std::path::Path::new("/repo");
+        let p = resolve_memory_path(root, "knowledge/auth_notes");
+        assert!(p.to_string_lossy().ends_with("knowledge/auth_notes.md"));
+    }
+
+    #[test]
+    fn memory_path_prompts_subpath() {
+        let root = std::path::Path::new("/repo");
+        let p = resolve_memory_path(root, "prompts/developer");
+        assert!(p.to_string_lossy().ends_with("prompts/developer.md"));
+    }
+
+    // ── memory_read / memory_write ───────────────────────────────────────────
+
+    #[test]
+    fn memory_write_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        memory_write(&json!({"key": "knowledge/test_note", "content": "important fact"}), dir.path()).unwrap();
+        let r = memory_read(&json!({"key": "knowledge/test_note"}), dir.path()).unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("important fact"));
+    }
+
+    #[test]
+    fn memory_write_append_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        memory_write(&json!({"key": "plan", "content": "step 1\n"}), dir.path()).unwrap();
+        memory_write(&json!({"key": "plan", "content": "step 2\n", "append": true}), dir.path()).unwrap();
+        let r = memory_read(&json!({"key": "plan"}), dir.path()).unwrap();
+        assert!(r.output.contains("step 1"));
+        assert!(r.output.contains("step 2"));
+    }
+
+    #[test]
+    fn memory_write_overwrite_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        memory_write(&json!({"key": "plan", "content": "old content"}), dir.path()).unwrap();
+        memory_write(&json!({"key": "plan", "content": "new content"}), dir.path()).unwrap();
+        let r = memory_read(&json!({"key": "plan"}), dir.path()).unwrap();
+        assert!(r.output.contains("new content"));
+        assert!(!r.output.contains("old content"));
+    }
+
+    #[test]
+    fn memory_read_missing_key_returns_error_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = memory_read(&json!({"key": "nonexistent_key_xyz"}), dir.path()).unwrap();
+        assert!(!r.success);
+    }
+
+    // ── read_file / write_file / str_replace ─────────────────────────────────
+
+    #[test]
+    fn write_then_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&json!({"path": "hello.txt", "content": "line1\nline2\n"}), dir.path()).unwrap();
+        let r = read_file(&json!({"path": "hello.txt"}), dir.path()).unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("line1"));
+        assert!(r.output.contains("line2"));
+    }
+
+    #[test]
+    fn read_file_includes_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta\n").unwrap();
+        let r = read_file(&json!({"path": "f.txt"}), dir.path()).unwrap();
+        assert!(r.output.contains("1\t") || r.output.contains("1 "));
+    }
+
+    #[test]
+    fn read_file_line_range() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "alpha\nbeta\ngamma\ndelta\nepsilon\n").unwrap();
+        let r = read_file(&json!({"path": "f.txt", "start_line": 2, "end_line": 3}), dir.path()).unwrap();
+        assert!(r.output.contains("beta"),  "should contain line 2");
+        assert!(r.output.contains("gamma"), "should contain line 3");
+        assert!(!r.output.contains("epsilon"), "should not contain line 5");
+        assert!(!r.output.contains("delta"),   "should not contain line 4");
+    }
+
+    #[test]
+    fn read_file_missing_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = read_file(&json!({"path": "does_not_exist.txt"}), dir.path());
+        assert!(r.is_err() || r.map(|t| !t.success).unwrap_or(true));
+    }
+
+    #[test]
+    fn write_file_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&json!({"path": "a/b/c/file.txt", "content": "hello"}), dir.path()).unwrap();
+        assert!(dir.path().join("a/b/c/file.txt").exists());
+    }
+
+    #[test]
+    fn str_replace_unique_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "fn foo() {}\nfn bar() {}\n").unwrap();
+        str_replace(
+            &json!({"path": "f.rs", "old_str": "fn foo()", "new_str": "fn baz()"}),
+            dir.path(),
+        ).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("f.rs")).unwrap();
+        assert!(content.contains("fn baz()"));
+        assert!(!content.contains("fn foo()"));
+    }
+
+    #[test]
+    fn str_replace_fails_on_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "x\nx\n").unwrap();
+        let result = str_replace(
+            &json!({"path": "f.rs", "old_str": "x", "new_str": "y"}),
+            dir.path(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn str_replace_fails_on_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "fn foo() {}").unwrap();
+        let result = str_replace(
+            &json!({"path": "f.rs", "old_str": "fn missing()", "new_str": "fn other()"}),
+            dir.path(),
+        );
+        assert!(result.is_err());
+    }
+
+    // ── find_files ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn find_files_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("readme.md"), "").unwrap();
+        let r = find_files(&json!({"pattern": "*.rs"}), dir.path()).unwrap();
+        assert!(r.output.contains("main.rs"));
+        assert!(r.output.contains("lib.rs"));
+        assert!(!r.output.contains("readme.md"));
+    }
+
+    #[test]
+    fn find_files_substring_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("test_auth.rs"), "").unwrap();
+        std::fs::write(dir.path().join("test_db.rs"), "").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "").unwrap();
+        // "test*" matches files starting with "test"
+        let r = find_files(&json!({"pattern": "test*"}), dir.path()).unwrap();
+        assert!(r.output.contains("test_auth.rs"), "should match test_auth.rs");
+        assert!(r.output.contains("test_db.rs"),   "should match test_db.rs");
+        assert!(!r.output.contains("main.rs"),     "should not match main.rs");
+    }
+
+    // ── search_in_files ──────────────────────────────────────────────────────
+
+    #[test]
+    fn search_in_files_basic_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() {}\nfn bar() {}\n").unwrap();
+        let r = search_in_files(&json!({"pattern": "fn \\w+", "ext": "rs"}), dir.path()).unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("fn foo"));
+        assert!(r.output.contains("fn bar"));
+    }
+
+    #[test]
+    fn search_in_files_no_match() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn foo() {}").unwrap();
+        let r = search_in_files(&json!({"pattern": "NONEXISTENT_PATTERN_XYZ"}), dir.path()).unwrap();
+        // Returns success=true with "No matches" message — not an error
+        assert!(r.success);
+        assert!(r.output.contains("No matches") || r.output.contains("0"));
+    }
+
+    // ── strip_html ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_html_basic_tags() {
+        // Each closing > inserts a space, so adjacent tags produce extra spaces
+        // The output collapses per-line but spaces within a line stay
+        let out = strip_html("<p>Hello <b>world</b></p>");
+        assert!(out.contains("Hello"), "should contain Hello");
+        assert!(out.contains("world"), "should contain world");
+    }
+
+    #[test]
+    fn strip_html_removes_script_block() {
+        let html = "<script>alert(1)</script><p>text</p>";
+        let out = strip_html(html);
+        assert!(!out.contains("alert"));
+        assert!(out.contains("text"));
+    }
+
+    #[test]
+    fn strip_html_removes_style_block() {
+        let html = "<style>.foo { color: red }</style><p>content</p>";
+        let out = strip_html(html);
+        assert!(!out.contains("color"));
+        assert!(out.contains("content"));
+    }
+
+    #[test]
+    fn strip_html_decodes_entities() {
+        let out = strip_html("&amp; &lt; &gt; &quot; &#39; &nbsp;");
+        assert!(out.contains('&'));
+        assert!(out.contains('<'));
+        assert!(out.contains('>'));
+    }
+
+    #[test]
+    fn strip_html_collapses_empty_lines() {
+        // strip_html removes empty lines but does not collapse spaces within a line
+        let out = strip_html("<p>\n\n\ntext\n\n\n</p>");
+        assert!(out.contains("text"));
+        assert!(!out.contains("\n\n"), "consecutive empty lines should be removed");
+    }
+
+    // ── percent_decode ───────────────────────────────────────────────────────
+
+    #[test]
+    fn percent_decode_space() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+    }
+
+    #[test]
+    fn percent_decode_slash() {
+        assert_eq!(percent_decode("foo%2Fbar"), "foo/bar");
+    }
+
+    #[test]
+    fn percent_decode_plus_as_space() {
+        // DDG uses + for spaces in some places
+        let out = percent_decode("hello+world");
+        assert!(out == "hello world" || out == "hello+world"); // implementation-defined
+    }
+
+    #[test]
+    fn percent_decode_passthrough_plain() {
+        assert_eq!(percent_decode("no-encoding"), "no-encoding");
+    }
+
+    #[test]
+    fn percent_decode_empty() {
+        assert_eq!(percent_decode(""), "");
+    }
+
+    // ── base64_decode_content ────────────────────────────────────────────────
+
+    #[test]
+    fn base64_decode_roundtrip() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let original = "fn main() { println!(\"hello\"); }";
+        let encoded = STANDARD.encode(original);
+        assert_eq!(base64_decode_content(&encoded), original);
+    }
+
+    #[test]
+    fn base64_decode_strips_github_newlines() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let original = "fn main() { println!(\"hello world from GitHub\"); }";
+        let encoded = STANDARD.encode(original);
+        // GitHub wraps base64 at 60 chars with \n
+        let chunked: String = encoded
+            .chars()
+            .enumerate()
+            .flat_map(|(i, c)| {
+                if i > 0 && i % 60 == 0 { vec!['\n', c] } else { vec![c] }
+            })
+            .collect();
+        assert!(chunked.contains('\n'));
+        assert_eq!(base64_decode_content(&chunked), original);
+    }
+
+    #[test]
+    fn base64_decode_invalid_returns_fallback() {
+        let out = base64_decode_content("not!!valid!!base64");
+        assert!(out.starts_with("[binary content"));
+    }
+
+    // ── parse_coverage_percent ───────────────────────────────────────────────
+
+    #[test]
+    fn coverage_tarpaulin_format() {
+        let out = "85.23% coverage, 234/275 lines covered";
+        assert_eq!(parse_coverage_percent(out), Some(85.23));
+    }
+
+    #[test]
+    fn coverage_pytest_total_line() {
+        let out = "TOTAL    1000    150    85%";
+        assert_eq!(parse_coverage_percent(out), Some(85.0));
+    }
+
+    #[test]
+    fn coverage_no_percentage_returns_none() {
+        assert_eq!(parse_coverage_percent("error: no tests found"), None);
+    }
+
+    #[test]
+    fn coverage_ignores_values_over_100() {
+        // "200% faster" не должно приниматься за coverage
+        let out = "200% faster startup\n72% coverage";
+        assert_eq!(parse_coverage_percent(out), Some(72.0));
+    }
+
+    #[test]
+    fn coverage_zero_percent() {
+        let out = "0% coverage, 0/100 lines covered";
+        assert_eq!(parse_coverage_percent(out), Some(0.0));
+    }
+
+    // ── detect_lang ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn detect_lang_rust() {
+        assert!(matches!(detect_lang(std::path::Path::new("foo.rs")), Lang::Rust));
+    }
+
+    #[test]
+    fn detect_lang_typescript() {
+        assert!(matches!(detect_lang(std::path::Path::new("foo.ts")), Lang::TypeScript));
+        assert!(matches!(detect_lang(std::path::Path::new("foo.tsx")), Lang::TypeScript));
+    }
+
+    #[test]
+    fn detect_lang_javascript() {
+        assert!(matches!(detect_lang(std::path::Path::new("foo.js")), Lang::JavaScript));
+        assert!(matches!(detect_lang(std::path::Path::new("foo.mjs")), Lang::JavaScript));
+    }
+
+    #[test]
+    fn detect_lang_python() {
+        assert!(matches!(detect_lang(std::path::Path::new("foo.py")), Lang::Python));
+    }
+
+    #[test]
+    fn detect_lang_cpp() {
+        assert!(matches!(detect_lang(std::path::Path::new("foo.cpp")), Lang::Cpp));
+        assert!(matches!(detect_lang(std::path::Path::new("foo.hpp")), Lang::Cpp));
+        assert!(matches!(detect_lang(std::path::Path::new("foo.h")), Lang::Cpp));
+    }
+
+    #[test]
+    fn detect_lang_kotlin() {
+        assert!(matches!(detect_lang(std::path::Path::new("foo.kt")), Lang::Kotlin));
+    }
+
+    #[test]
+    fn detect_lang_unknown() {
+        assert!(matches!(detect_lang(std::path::Path::new("foo.md")), Lang::Unknown));
+        assert!(matches!(detect_lang(std::path::Path::new("foo")), Lang::Unknown));
+    }
+
+    // ── AST parsers ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_rust_pub_fn() {
+        let src = "pub fn hello(x: i32) -> String { todo!() }";
+        let syms = parse_rust(src);
+        assert!(syms.iter().any(|s| s.name == "hello" && s.kind == "fn"));
+    }
+
+    #[test]
+    fn parse_rust_async_fn() {
+        let src = "pub async fn handle(req: Request) -> Response { todo!() }";
+        let syms = parse_rust(src);
+        assert!(syms.iter().any(|s| s.name == "handle" && s.kind == "fn"));
+    }
+
+    #[test]
+    fn parse_rust_struct() {
+        let src = "pub struct Config { pub value: i32 }";
+        let syms = parse_rust(src);
+        assert!(syms.iter().any(|s| s.name == "Config" && s.kind == "struct"));
+    }
+
+    #[test]
+    fn parse_rust_enum() {
+        let src = "pub enum Status { Ok, Err }";
+        let syms = parse_rust(src);
+        assert!(syms.iter().any(|s| s.name == "Status" && s.kind == "enum"));
+    }
+
+    #[test]
+    fn parse_rust_impl_block() {
+        // Multi-line impl: parser tracks brace depth per-line, single-line impl
+        // opens and closes braces on same line so fn may not get container.
+        // Test the symbols are found regardless of container tracking.
+        let src = "impl Foo {\n    fn bar(&self) {}\n}";
+        let syms = parse_rust(src);
+        assert!(syms.iter().any(|s| s.kind == "fn" && s.name == "bar"),
+            "should find fn bar inside impl block");
+    }
+
+    #[test]
+    fn parse_rust_trait() {
+        let src = "pub trait Handler { fn handle(&self); }";
+        let syms = parse_rust(src);
+        assert!(syms.iter().any(|s| s.kind == "trait" && s.name == "Handler"));
+    }
+
+    #[test]
+    fn parse_rust_empty_source() {
+        assert!(parse_rust("").is_empty());
+    }
+
+    #[test]
+    fn parse_python_class_and_method() {
+        let src = "class MyClass:\n    def my_method(self):\n        pass\n";
+        let syms = parse_python(src);
+        assert!(syms.iter().any(|s| s.kind == "class" && s.name == "MyClass"),
+            "should find class MyClass");
+        // Methods inside a class get kind="method", not "fn"
+        assert!(syms.iter().any(|s| s.kind == "method" && s.name == "my_method"),
+            "should find my_method with kind=method");
+    }
+
+    #[test]
+    fn parse_python_top_level_fn() {
+        let src = "def process(x, y):\n    return x + y\n";
+        let syms = parse_python(src);
+        assert!(syms.iter().any(|s| s.name == "process"));
+    }
+
+    #[test]
+    fn parse_python_async_fn() {
+        let src = "async def fetch(url: str) -> str:\n    pass\n";
+        let syms = parse_python(src);
+        assert!(syms.iter().any(|s| s.name == "fetch"));
+    }
+
+    #[test]
+    fn parse_ts_function() {
+        let src = "export function greet(name: string): string { return `Hello ${name}`; }";
+        let syms = parse_ts_js(src);
+        assert!(syms.iter().any(|s| s.name == "greet"));
+    }
+
+    #[test]
+    fn parse_ts_class() {
+        let src = "export class UserService { constructor() {} }";
+        let syms = parse_ts_js(src);
+        assert!(syms.iter().any(|s| s.kind == "class" && s.name == "UserService"));
+    }
+
+    #[test]
+    fn parse_ts_arrow_fn() {
+        let src = "const add = (a: number, b: number) => a + b;";
+        let syms = parse_ts_js(src);
+        assert!(syms.iter().any(|s| s.name == "add"));
+    }
+
+    // ── normalize_path / resolve ─────────────────────────────────────────────
+
+    #[test]
+    fn normalize_path_removes_dotdot() {
+        let p = normalize_path(std::path::Path::new("/a/b/../c"));
+        assert_eq!(p, std::path::PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn normalize_path_removes_dot() {
+        let p = normalize_path(std::path::Path::new("/a/./b"));
+        assert_eq!(p, std::path::PathBuf::from("/a/b"));
+    }
+
+    #[test]
+    fn resolve_subpath_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve(dir.path(), "src/main.rs").unwrap();
+        assert!(result.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn resolve_traversal_escapes_root() {
+        // Важно знать: текущая реализация resolve() НЕ блокирует traversal.
+        // Этот тест документирует фактическое поведение.
+        // Если в будущем добавить проверку — тест должен инвертироваться.
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve(dir.path(), "../../../etc/passwd");
+        // Сейчас это Ok, но путь уходит за пределы root
+        if let Ok(p) = result {
+            assert!(!p.starts_with(dir.path()),
+                "resolve() currently does NOT block traversal — this documents the gap");
+        }
+    }
 }
