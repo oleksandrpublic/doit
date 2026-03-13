@@ -11,8 +11,8 @@ pub struct Turn {
 }
 
 pub struct History {
-    turns: Vec<Turn>,
-    window: usize,
+    pub turns: Vec<Turn>,
+    pub window: usize,
 }
 
 impl History {
