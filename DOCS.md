@@ -165,7 +165,7 @@ do_it roles   List all roles with their tool allowlists
 --task, -t        Task text, path to a .md file, or path to an image
 --repo, -r        Repository / working directory (default: .)
 --config, -c      Path to config.toml (default: ./config.toml)
---role            Agent role: boss | research | developer | navigator | qa | memory
+--role            Agent role: boss | research | developer | navigator | qa | reviewer | memory
 --system-prompt   Override system prompt: inline text or path to a file
 --max-steps       Maximum agent steps (default: 30)
 ```
@@ -227,6 +227,7 @@ do_it roles   # print all roles and their allowlists
 | `developer` | Reading and writing code | `read/write_file`, `str_replace`, `run_command`, `diff_repo`, `git_*`, AST tools, `github_api`, `test_coverage`, `notify` |
 | `navigator` | Exploring codebase structure | `tree`, `list_dir`, `find_files`, `search_in_files`, `find_references`, AST tools |
 | `qa` | Testing and verification | `run_command`, `read_file`, `search_in_files`, `diff_repo`, `git_status`, `git_log`, `github_api`, `test_coverage`, `notify` |
+| `reviewer` | Static code review — no execution | `read_file`, `search_in_files`, `find_references`, AST tools, `diff_repo`, `git_log`, `memory_read/write`, `ask_human` |
 | `memory` | Managing `.ai/` state | `memory_read`, `memory_write` |
 
 ### System prompt priority
@@ -355,6 +356,8 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 | `history` | `.ai/logs/history.md` |
 | `knowledge/<n>` | `.ai/knowledge/<n>.md` |
 | `prompts/<n>` | `.ai/prompts/<n>.md` |
+| `user_profile` | `~/.do_it/user_profile.md` (global) |
+| `boss_notes` | `~/.do_it/boss_notes.md` (global) |
 | any other key | `.ai/knowledge/<key>.md` |
 
 **Persistent knowledge keys used by built-in roles:**
@@ -364,6 +367,7 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 | `knowledge/lessons_learned` | QA | Project-specific pitfalls and correct patterns |
 | `knowledge/decisions` | Boss, Developer | Architectural decisions and rationale |
 | `knowledge/qa_report` | QA | Latest test run report |
+| `knowledge/review_report` | Reviewer | Latest static code review |
 | `knowledge/<role>_result` | Sub-agents | Results from `spawn_agent` calls |
 
 ### Communication
@@ -433,9 +437,11 @@ The next run will show: `[inbox] 2 external message(s) received`.
 ```
 session_init():
   → increment .ai/state/session_counter.txt
-  → read last_session.md          → inject into history as step 0
-  → read external_messages.md     → inject into history, then clear the file
-  → read/scaffold .ai/project.toml → inject into history as project context
+  → read last_session.md              → inject into history as step 0
+  → read user_profile.md (Boss only)  → inject into history (global preferences)
+  → read boss_notes.md   (Boss only)  → inject into history (cross-project insights)
+  → read external_messages.md         → inject into history, then clear the file
+  → read/scaffold .ai/project.toml   → inject into history as project context
 ```
 
 On first run in a new repository, `.ai/project.toml` is scaffolded automatically by detecting `Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` and reading the GitHub remote from `.git/config`. Edit it freely — it will not be overwritten.
@@ -558,7 +564,7 @@ After the sub-agent finishes, the boss reads the results:
 
 | Argument | Required | Description |
 |---|---|---|
-| `role` | yes | Sub-agent role: `research`, `developer`, `navigator`, `qa`, `memory` |
+| `role` | yes | Sub-agent role: `research`, `developer`, `navigator`, `qa`, `reviewer`, `memory` |
 | `task` | yes | Task description — what the sub-agent should do |
 | `memory_key` | no | Where to write results (default: `knowledge/agent_result`) |
 | `max_steps` | no | Step limit (default: parent's `max_steps / 2`, min 5) |
@@ -572,7 +578,7 @@ do_it run --task "Add OAuth2 login to the API" --role boss --max-steps 80
 ```
 
 ```
-boss: reads last_session, plan, decisions → writes task breakdown to plan
+boss: reads last_session, plan, decisions, user_profile → writes task breakdown to plan
   │
   ├─ spawn_agent(role="research", task="find best OAuth crates for Axum",
   │              memory_key="knowledge/oauth_research")
@@ -588,11 +594,15 @@ boss: reads last_session, plan, decisions → writes task breakdown to plan
   │              memory_key="knowledge/impl_notes")
   │    └─ developer writes code, runs tests, commits
   │
+  ├─ spawn_agent(role="reviewer", task="review the OAuth2 implementation",
+  │              memory_key="knowledge/review_report")
+  │    └─ reviewer reads code, checks decisions.md, writes structured report
+  │
   ├─ spawn_agent(role="qa", task="verify all tests pass, check coverage",
   │              memory_key="knowledge/qa_report")
   │    └─ qa runs test_coverage, writes report, appends lessons_learned
   │
-  └─ boss: reads qa_report → notify("OAuth2 complete, all tests pass") → finish
+  └─ boss: reads review_report + qa_report → notify("OAuth2 complete") → finish
 ```
 
 ---
@@ -632,6 +642,23 @@ The agent maintains persistent state in `.ai/` at the repository root. This dire
 **`lessons_learned.md`** — QA appends project-specific anti-patterns and correct approaches after each session. The agent reads this before starting work to avoid repeating mistakes.
 
 **`decisions.md`** — Boss and Developer log significant architectural decisions: what was chosen, what alternatives were considered, and why. Consulted before redesigning anything.
+
+**`review_report.md`** — Reviewer writes a structured static analysis after each review session: architectural issues, code smells, convention violations, potential bugs, with per-finding severity ratings.
+
+### Global memory — `~/.do_it/`
+
+Two files in `~/.do_it/` persist across all projects. The `boss` role reads them automatically at the start of every session (if they contain actual content, not just the default comments).
+
+| File | Key | Purpose |
+|---|---|---|
+| `user_profile.md` | `user_profile` | Your preferences: communication language, tech stack, preferred crates, workflow style. Edit once, applies to all projects. |
+| `boss_notes.md` | `boss_notes` | Cross-project insights the Boss accumulates — patterns that work, approaches to avoid, ideas for future projects. |
+
+Boss reads these files and appends to them over time:
+- When it learns something stable about you → updates `user_profile` via `memory_write("user_profile", ...)`
+- When it discovers a cross-project insight → appends to `boss_notes` via `memory_write("boss_notes", ..., append=true)`
+
+Both files are created with commented templates on first run. They are only injected into context when they contain actual content (not just `#` comment lines).
 
 ---
 
@@ -759,7 +786,7 @@ ollama list
 
 ```
 do_it/
-├── Cargo.toml           name="do_it", edition="2024", version="0.2.1"
+├── Cargo.toml           name="do_it", edition="2024", version="0.2.2"
 ├── config.toml          runtime configuration (models, Telegram, prompt)
 ├── README.md            project overview
 ├── DOCS.md              this file
@@ -770,14 +797,23 @@ do_it/
 │   ├── prompts/         custom role prompts
 │   ├── state/           plan, last_session, session_counter, external_messages
 │   ├── logs/            history.md
-│   └── knowledge/       lessons_learned, decisions, qa_report, sub-agent results
+│   └── knowledge/       lessons_learned, decisions, qa_report, review_report, sub-agent results
 └── src/
     ├── main.rs          CLI: run | config | roles; --role flag; image detection
-    ├── agent.rs         main loop, session_init, loop detection, project.toml scaffolding
-    ├── config.rs        AgentConfig, Role enum + allowlists + built-in prompts, ModelRouter, ensure_global_config
+    ├── agent.rs         main loop, session_init (user_profile + boss_notes injection), loop detection
+    ├── config.rs        AgentConfig, Role enum + allowlists, ModelRouter, global memory helpers
     ├── history.rs       sliding window context manager
     ├── shell.rs         Ollama HTTP client: chat, chat_with_image, check_models
-    └── tools.rs         all tools: filesystem, git, web, GitHub API, AST, memory, spawn_agent, notify, test_coverage
+    ├── tools.rs         all tools: filesystem, git, web, GitHub API, AST, memory, spawn_agent, notify, test_coverage
+    └── prompts/         built-in role prompts compiled into the binary via include_str!
+        ├── default.md
+        ├── boss.md
+        ├── developer.md
+        ├── navigator.md
+        ├── qa.md
+        ├── reviewer.md
+        ├── research.md
+        └── memory.md
 ```
 
 ### Dependencies

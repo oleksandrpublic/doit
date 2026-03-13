@@ -17,9 +17,9 @@ Most of the new features were designed and implemented by [Claude Sonnet 4.6](ht
 
 - **Local-first** — runs entirely on your machine via Ollama, no cloud APIs required
 - **Cross-platform** — Windows (MSVC) and Linux, no shell operators, no Python
-- **Agent roles** — focused tool sets and prompts per task type: `developer`, `navigator`, `qa`, `boss`, `research`, `memory`
+- **Agent roles** — focused tool sets and prompts per task type: `developer`, `navigator`, `qa`, `boss`, `research`, `reviewer`, `memory`
 - **Sub-agent orchestration** — `boss` role delegates to specialised sub-agents via `spawn_agent`; results flow through shared memory
-- **Persistent memory** — `.ai/` hierarchy: session notes, task plan, knowledge base, architectural decisions, lessons learned
+- **Persistent memory** — `.ai/` hierarchy: session notes, task plan, knowledge base, architectural decisions, lessons learned. Global `~/.do_it/` memory for user preferences and cross-project boss insights
 - **Project auto-detection** — `.ai/project.toml` scaffolded on first run with commands, GitHub repo, and agent conventions
 - **GitHub integration** — `github_api` tool for issues, PRs, branches, commits, file contents (token from env)
 - **Test coverage** — `test_coverage` auto-detects Rust/Node/Python and runs the right tool
@@ -61,6 +61,7 @@ Each role restricts the agent to a focused set of tools and a role-specific syst
 | `navigator` | Explore codebase structure | tree, find_files, search, outline, find_references |
 | `research` | Find information | web_search, fetch_url, memory |
 | `qa` | Run tests, verify changes | test_coverage, diff_repo, git_log, search, github_api |
+| `reviewer` | Static code review — no execution | read_file, search, outline, diff_repo, memory |
 | `boss` | Plan and orchestrate | memory, spawn_agent, web_search, ask_human, notify |
 | `memory` | Manage `.ai/` state | memory_read, memory_write |
 
@@ -100,12 +101,13 @@ do_it run --task "Add OAuth2 login" --role boss --max-steps 80
 ```
 
 ```
-boss: reads last_session, plan, decisions
+boss: reads last_session, plan, decisions, user_profile
   │
-  ├─ spawn_agent("research", "find best OAuth crates for Axum", memory_key="knowledge/oauth")
-  ├─ spawn_agent("navigator", "locate existing auth middleware", memory_key="knowledge/structure")
+  ├─ spawn_agent("research",  "find best OAuth crates for Axum",    memory_key="knowledge/oauth")
+  ├─ spawn_agent("navigator", "locate existing auth middleware",     memory_key="knowledge/structure")
   ├─ spawn_agent("developer", "implement OAuth per the plan")
-  ├─ spawn_agent("qa", "verify all tests pass", memory_key="knowledge/qa_report")
+  ├─ spawn_agent("reviewer",  "review the OAuth implementation",    memory_key="knowledge/review_report")
+  ├─ spawn_agent("qa",        "verify all tests pass",              memory_key="knowledge/qa_report")
   └─ notify("OAuth complete, all tests pass") → finish
 ```
 
@@ -129,7 +131,14 @@ boss: reads last_session, plan, decisions
     └── qa_report.md           ← latest test results
 ```
 
-Write to `external_messages.md` before a run to send instructions without changing `--task`. The agent reads it on startup and clears it.
+Global memory in `~/.do_it/` persists across all projects and is read by the `boss` role at startup:
+
+| File | Purpose |
+|---|---|
+| `user_profile.md` | Your preferences: language, stack, workflow style. Boss reads this every session. |
+| `boss_notes.md` | Cross-project insights accumulated by Boss — patterns that apply beyond the current repo. |
+
+Edit `~/.do_it/user_profile.md` once and the boss will always know your stack and conventions.
 
 ---
 

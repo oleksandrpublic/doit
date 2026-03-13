@@ -1,7 +1,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-use crate::config::{AgentConfig, ModelRole, ModelRouter, Role};
+use crate::config::{AgentConfig, ModelRole, ModelRouter, Role,
+                    global_user_profile_path, global_boss_notes_path};
 use crate::history::{History, Turn};
 use crate::shell::OllamaClient;
 use crate::tools::{self, LlmAction, TelegramConfig};
@@ -380,6 +381,41 @@ impl SweAgent {
                     output: content,
                     success: true,
                 });
+            }
+        }
+
+        // Inject global user_profile and boss_notes for the Boss role.
+        // Other roles don't need cross-project context — they work on the current task only.
+        if self.role == Role::Boss {
+            if let Some(path) = global_user_profile_path() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if !content.trim().is_empty() && !content.trim_start().starts_with('#') {
+                        println!("  [memory] Loading user_profile");
+                        self.history.push(Turn {
+                            step: 0,
+                            thought: "Loading persistent user profile".to_string(),
+                            tool: "memory_read".to_string(),
+                            args: serde_json::json!({ "key": "user_profile" }),
+                            output: format!("## User profile (~/.do_it/user_profile.md)\n{content}"),
+                            success: true,
+                        });
+                    }
+                }
+            }
+            if let Some(path) = global_boss_notes_path() {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if !content.trim().is_empty() && !content.trim_start().starts_with('#') {
+                        println!("  [memory] Loading boss_notes");
+                        self.history.push(Turn {
+                            step: 0,
+                            thought: "Loading cross-project boss notes".to_string(),
+                            tool: "memory_read".to_string(),
+                            args: serde_json::json!({ "key": "boss_notes" }),
+                            output: format!("## Boss notes (~/.do_it/boss_notes.md)\n{content}"),
+                            success: true,
+                        });
+                    }
+                }
             }
         }
 

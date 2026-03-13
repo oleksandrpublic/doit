@@ -715,9 +715,20 @@ async fn diff_repo(args: &Value, root: &Path) -> Result<ToolResult> {
 
 const AI_DIR: &str = ".ai";
 
-fn resolve_memory_path(root: &Path, key: &str) -> PathBuf {
+/// Resolve a logical memory key to an absolute file path.
+/// Returns None only for global keys (user_profile, boss_notes) when the
+/// home directory cannot be determined.
+fn resolve_memory_path(root: &Path, key: &str) -> Option<PathBuf> {
+    // Global keys — stored in ~/.do_it/, shared across all projects
+    if key == "user_profile" {
+        return crate::config::global_user_profile_path();
+    }
+    if key == "boss_notes" {
+        return crate::config::global_boss_notes_path();
+    }
+
     let ai = root.join(AI_DIR);
-    match key {
+    let path = match key {
         "plan"            => ai.join("state/current_plan.md"),
         "last_session"    => ai.join("state/last_session.md"),
         "session_counter" => ai.join("state/session_counter.txt"),
@@ -731,7 +742,8 @@ fn resolve_memory_path(root: &Path, key: &str) -> PathBuf {
                 ai.join(format!("knowledge/{}.md", other))
             }
         }
-    }
+    };
+    Some(path)
 }
 
 /// Ensure the .ai/ directory hierarchy exists.
@@ -750,7 +762,13 @@ fn memory_read(args: &Value, root: &Path) -> Result<ToolResult> {
     let key = str_arg(args, "key")?;
     ensure_ai_dirs(root)?;
 
-    let path = resolve_memory_path(root, key);
+    let path = match resolve_memory_path(root, key) {
+        Some(p) => p,
+        None => return Ok(ToolResult {
+            output: format!("memory_read '{key}': cannot resolve path (home directory unavailable)"),
+            success: false,
+        }),
+    };
 
     if !path.exists() {
         return Ok(ToolResult {
@@ -781,7 +799,13 @@ fn memory_write(args: &Value, root: &Path) -> Result<ToolResult> {
 
     ensure_ai_dirs(root)?;
 
-    let path = resolve_memory_path(root, key);
+    let path = match resolve_memory_path(root, key) {
+        Some(p) => p,
+        None => return Ok(ToolResult {
+            output: format!("memory_write '{key}': cannot resolve path (home directory unavailable)"),
+            success: false,
+        }),
+    };
 
     // Create parent dirs if needed (e.g. knowledge/ or prompts/)
     if let Some(parent) = path.parent() {
@@ -2525,32 +2549,47 @@ mod tests {
     #[test]
     fn memory_path_named_keys() {
         let root = std::path::Path::new("/repo");
-        assert!(resolve_memory_path(root, "plan").to_string_lossy().ends_with("state/current_plan.md"));
-        assert!(resolve_memory_path(root, "last_session").to_string_lossy().ends_with("state/last_session.md"));
-        assert!(resolve_memory_path(root, "session_counter").to_string_lossy().ends_with("state/session_counter.txt"));
-        assert!(resolve_memory_path(root, "external").to_string_lossy().ends_with("state/external_messages.md"));
-        assert!(resolve_memory_path(root, "history").to_string_lossy().ends_with("logs/history.md"));
+        assert!(resolve_memory_path(root, "plan").unwrap().to_string_lossy().ends_with("state/current_plan.md"));
+        assert!(resolve_memory_path(root, "last_session").unwrap().to_string_lossy().ends_with("state/last_session.md"));
+        assert!(resolve_memory_path(root, "session_counter").unwrap().to_string_lossy().ends_with("state/session_counter.txt"));
+        assert!(resolve_memory_path(root, "external").unwrap().to_string_lossy().ends_with("state/external_messages.md"));
+        assert!(resolve_memory_path(root, "history").unwrap().to_string_lossy().ends_with("logs/history.md"));
     }
 
     #[test]
     fn memory_path_bare_key_goes_to_knowledge() {
         let root = std::path::Path::new("/repo");
-        let p = resolve_memory_path(root, "my_notes");
+        let p = resolve_memory_path(root, "my_notes").unwrap();
         assert!(p.to_string_lossy().ends_with("knowledge/my_notes.md"));
     }
 
     #[test]
     fn memory_path_explicit_subpath() {
         let root = std::path::Path::new("/repo");
-        let p = resolve_memory_path(root, "knowledge/auth_notes");
+        let p = resolve_memory_path(root, "knowledge/auth_notes").unwrap();
         assert!(p.to_string_lossy().ends_with("knowledge/auth_notes.md"));
     }
 
     #[test]
     fn memory_path_prompts_subpath() {
         let root = std::path::Path::new("/repo");
-        let p = resolve_memory_path(root, "prompts/developer");
+        let p = resolve_memory_path(root, "prompts/developer").unwrap();
         assert!(p.to_string_lossy().ends_with("prompts/developer.md"));
+    }
+
+    #[test]
+    fn memory_path_global_keys() {
+        let root = std::path::Path::new("/repo");
+        // Global keys resolve independently of root.
+        // They return None only when HOME is unavailable — we just check the shape.
+        if let Some(p) = resolve_memory_path(root, "user_profile") {
+            assert!(p.to_string_lossy().contains(".do_it"), "user_profile should be under .do_it");
+            assert!(p.to_string_lossy().ends_with("user_profile.md"));
+        }
+        if let Some(p) = resolve_memory_path(root, "boss_notes") {
+            assert!(p.to_string_lossy().contains(".do_it"), "boss_notes should be under .do_it");
+            assert!(p.to_string_lossy().ends_with("boss_notes.md"));
+        }
     }
 
     // ── memory_read / memory_write ───────────────────────────────────────────

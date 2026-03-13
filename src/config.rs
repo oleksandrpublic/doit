@@ -30,7 +30,7 @@ impl ModelRouter {
     }
 }
 
-/// Which kind of work the agent is doing on this step
+/// Which kind of work the agent is doing on this step.
 #[derive(Debug, Clone)]
 pub enum ModelRole {
     Thinking,
@@ -41,7 +41,7 @@ pub enum ModelRole {
 }
 
 impl ModelRole {
-    /// Derive role from the tool the LLM chose to call
+    /// Derive role from the tool the LLM chose to call.
     pub fn from_tool(tool: &str) -> Self {
         match tool {
             "write_file" | "str_replace"                                => Self::Coding,
@@ -63,11 +63,26 @@ impl ModelRole {
     }
 }
 
+// ─── Built-in prompts (compiled into the binary) ──────────────────────────────
+//
+// Each role has a corresponding src/prompts/<role>.md file.
+// To override a prompt for a specific project, place a file at
+// .ai/prompts/<role>.md in the repository root.
+
+const PROMPT_DEFAULT:   &str = include_str!("prompts/default.md");
+const PROMPT_BOSS:      &str = include_str!("prompts/boss.md");
+const PROMPT_RESEARCH:  &str = include_str!("prompts/research.md");
+const PROMPT_DEVELOPER: &str = include_str!("prompts/developer.md");
+const PROMPT_NAVIGATOR: &str = include_str!("prompts/navigator.md");
+const PROMPT_QA:        &str = include_str!("prompts/qa.md");
+const PROMPT_REVIEWER:  &str = include_str!("prompts/reviewer.md");
+const PROMPT_MEMORY:    &str = include_str!("prompts/memory.md");
 
 // ─── Agent roles ──────────────────────────────────────────────────────────────
 
-/// Predefined agent roles — each has a fixed tool allowlist and a default
-/// system prompt. The prompt can be overridden by placing a file at
+/// Predefined agent roles — each has a fixed tool allowlist and a built-in
+/// system prompt compiled from src/prompts/<role>.md.
+/// The prompt can be overridden at runtime by placing a file at
 /// .ai/prompts/<role>.md in the repository root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -85,6 +100,8 @@ pub enum Role {
     Navigator,
     /// Quality assurance: runs tests, checks diffs, reports issues
     Qa,
+    /// Reviewer: static code review — reads code only, never executes
+    Reviewer,
     /// Memory manager: reads and writes .ai/ state
     Memory,
 }
@@ -92,14 +109,15 @@ pub enum Role {
 impl Role {
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "default"   => Some(Self::Default),
-            "boss"      => Some(Self::Boss),
-            "research"  => Some(Self::Research),
-            "developer" | "dev" => Some(Self::Developer),
-            "navigator" | "nav" => Some(Self::Navigator),
-            "qa"        => Some(Self::Qa),
-            "memory"    => Some(Self::Memory),
-            _           => None,
+            "default"              => Some(Self::Default),
+            "boss"                 => Some(Self::Boss),
+            "research"             => Some(Self::Research),
+            "developer" | "dev"    => Some(Self::Developer),
+            "navigator" | "nav"    => Some(Self::Navigator),
+            "qa"                   => Some(Self::Qa),
+            "reviewer" | "review"  => Some(Self::Reviewer),
+            "memory"               => Some(Self::Memory),
+            _                      => None,
         }
     }
 
@@ -111,40 +129,46 @@ impl Role {
             Self::Developer => "developer",
             Self::Navigator => "navigator",
             Self::Qa        => "qa",
+            Self::Reviewer  => "reviewer",
             Self::Memory    => "memory",
         }
     }
 
-    /// Tool allowlist for this role. Empty = all tools allowed.
+    /// Tool allowlist for this role. Empty slice = all tools allowed.
     pub fn allowed_tools(&self) -> &'static [&'static str] {
         match self {
-            Self::Default => &[],  // empty = unrestricted
+            Self::Default => &[],  // unrestricted
+
             Self::Boss => &[
                 "memory_read", "memory_write",
                 "tree", "ask_human", "web_search",
-                "spawn_agent",
-                "notify",
+                "spawn_agent", "notify",
                 "finish",
             ],
+
             Self::Research => &[
                 "web_search", "fetch_url",
                 "memory_read", "memory_write",
                 "ask_human", "finish",
             ],
+
             Self::Developer => &[
                 "read_file", "write_file", "str_replace",
                 "run_command", "diff_repo",
-                "get_symbols", "outline", "get_signature",
+                "git_status", "git_commit", "git_log", "git_stash",
+                "get_symbols", "outline", "get_signature", "find_references",
                 "memory_read", "memory_write",
                 "github_api", "test_coverage", "notify",
                 "finish",
             ],
+
             Self::Navigator => &[
                 "tree", "list_dir", "find_files",
                 "search_in_files", "find_references",
                 "read_file", "get_symbols", "outline",
                 "finish",
             ],
+
             Self::Qa => &[
                 "run_command", "read_file",
                 "search_in_files", "diff_repo",
@@ -153,6 +177,18 @@ impl Role {
                 "ask_human", "github_api", "test_coverage", "notify",
                 "finish",
             ],
+
+            // Reviewer: read-only. No write_file, str_replace, run_command,
+            // git_commit, git_stash, spawn_agent, notify, test_coverage, github_api.
+            Self::Reviewer => &[
+                "read_file", "search_in_files", "find_references",
+                "get_symbols", "outline", "get_signature",
+                "diff_repo", "git_log",
+                "memory_read", "memory_write",
+                "ask_human",
+                "finish",
+            ],
+
             Self::Memory => &[
                 "memory_read", "memory_write", "finish",
             ],
@@ -160,8 +196,7 @@ impl Role {
     }
 
     /// Load system prompt: first try .ai/prompts/<role>.md, then built-in.
-    pub fn system_prompt(&self, repo_root: &std::path::Path) -> String {
-        // Try file override first
+    pub fn system_prompt(&self, repo_root: &Path) -> String {
         let prompt_path = repo_root
             .join(".ai/prompts")
             .join(format!("{}.md", self.name()));
@@ -171,53 +206,47 @@ impl Role {
                 return text;
             }
         }
-        self.builtin_prompt()
+        self.builtin_prompt().to_string()
     }
 
-    fn builtin_prompt(&self) -> String {
+    fn builtin_prompt(&self) -> &'static str {
         match self {
-            Self::Default => DEFAULT_SYSTEM_PROMPT.to_string(),
-            Self::Boss => BOSS_PROMPT.to_string(),
-            Self::Research => RESEARCH_PROMPT.to_string(),
-            Self::Developer => DEVELOPER_PROMPT.to_string(),
-            Self::Navigator => NAVIGATOR_PROMPT.to_string(),
-            Self::Qa => QA_PROMPT.to_string(),
-            Self::Memory => MEMORY_PROMPT.to_string(),
+            Self::Default   => PROMPT_DEFAULT,
+            Self::Boss      => PROMPT_BOSS,
+            Self::Research  => PROMPT_RESEARCH,
+            Self::Developer => PROMPT_DEVELOPER,
+            Self::Navigator => PROMPT_NAVIGATOR,
+            Self::Qa        => PROMPT_QA,
+            Self::Reviewer  => PROMPT_REVIEWER,
+            Self::Memory    => PROMPT_MEMORY,
         }
     }
 }
+
+// ─── AgentConfig ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// Ollama base URL
     pub ollama_base_url: String,
-
-    /// Default model — used when a role has no override in models
+    /// Default model — used when a role has no override in [models]
     pub model: String,
-
     /// Per-role model overrides (all optional)
     #[serde(default)]
     pub models: ModelRouter,
-
     /// Sampling temperature
     pub temperature: f64,
-
     /// Max tokens per LLM response
     pub max_tokens: u32,
-
     /// Keep last N steps in full in context; older ones are summarized
     pub history_window: usize,
-
     /// Truncate tool output to this many chars before sending to LLM
     pub max_output_chars: usize,
-
-    /// System prompt
+    /// System prompt (default role only — roles override this via Role::system_prompt)
     pub system_prompt: String,
-
     /// Telegram bot token for ask_human / notifications (optional)
     #[serde(default)]
     pub telegram_token: Option<String>,
-
     /// Telegram chat_id to send messages to (optional)
     #[serde(default)]
     pub telegram_chat_id: Option<String>,
@@ -233,7 +262,7 @@ impl Default for AgentConfig {
             max_tokens: 4096,
             history_window: 8,
             max_output_chars: 6000,
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
+            system_prompt: PROMPT_DEFAULT.to_string(),
             telegram_token: None,
             telegram_chat_id: None,
         }
@@ -242,30 +271,23 @@ impl Default for AgentConfig {
 
 impl AgentConfig {
     /// Load config following the priority chain:
-    ///   --config <path>  (explicit, always used if provided and not the default sentinel)
-    ///   ./config.toml    (local project config)
-    ///   ~/.do_it/config.toml  (global user config)
+    ///   --config <path>       — explicit CLI override
+    ///   ./config.toml         — local project config
+    ///   ~/.do_it/config.toml  — global user config
     ///   built-in defaults
-    ///
-    /// `explicit` is Some when the user passed --config explicitly.
     pub fn load(explicit: Option<&str>) -> Self {
-        // 1. Explicit --config path
         if let Some(path) = explicit {
             return Self::load_file(path).unwrap_or_else(|| {
                 tracing::warn!("Config '{}' not found or invalid, using defaults", path);
                 Self::default()
             });
         }
-
-        // 2. Local ./config.toml
         if Path::new("config.toml").exists() {
             if let Some(cfg) = Self::load_file("config.toml") {
                 tracing::info!("Config: ./config.toml");
                 return cfg;
             }
         }
-
-        // 3. ~/.do_it/config.toml
         if let Some(global) = global_config_path() {
             if global.exists() {
                 if let Some(cfg) = Self::load_file(&global.to_string_lossy()) {
@@ -274,13 +296,11 @@ impl AgentConfig {
                 }
             }
         }
-
-        // 4. Built-in defaults
         tracing::info!("Config: built-in defaults");
         Self::default()
     }
 
-    /// Legacy alias used internally — kept for compatibility.
+    /// Legacy alias — kept for compatibility.
     pub fn load_or_default(path: &str) -> Self {
         Self::load_file(path).unwrap_or_else(|| {
             tracing::warn!("Config '{}' not found, using defaults", path);
@@ -294,8 +314,8 @@ impl AgentConfig {
         }
         match std::fs::read_to_string(path).map(|s| toml::from_str::<Self>(&s)) {
             Ok(Ok(mut cfg)) => {
-                // If system_prompt is default, check for ~/.do_it/system_prompt.md override
-                if cfg.system_prompt == DEFAULT_SYSTEM_PROMPT {
+                // Apply ~/.do_it/system_prompt.md if config still has the default prompt
+                if cfg.system_prompt == PROMPT_DEFAULT {
                     if let Some(sp) = load_global_system_prompt() {
                         cfg.system_prompt = sp;
                     }
@@ -310,7 +330,7 @@ impl AgentConfig {
 
 // ─── Global config helpers ────────────────────────────────────────────────────
 
-/// Returns ~/.do_it as a PathBuf, or None if home dir cannot be determined.
+/// Returns ~/.do_it/ as a PathBuf, or None if home dir cannot be determined.
 pub fn global_config_dir() -> Option<std::path::PathBuf> {
     home_dir().map(|h| h.join(".do_it"))
 }
@@ -318,6 +338,16 @@ pub fn global_config_dir() -> Option<std::path::PathBuf> {
 /// Returns ~/.do_it/config.toml
 pub fn global_config_path() -> Option<std::path::PathBuf> {
     global_config_dir().map(|d| d.join("config.toml"))
+}
+
+/// Returns ~/.do_it/user_profile.md
+pub fn global_user_profile_path() -> Option<std::path::PathBuf> {
+    global_config_dir().map(|d| d.join("user_profile.md"))
+}
+
+/// Returns ~/.do_it/boss_notes.md
+pub fn global_boss_notes_path() -> Option<std::path::PathBuf> {
+    global_config_dir().map(|d| d.join("boss_notes.md"))
 }
 
 /// Load ~/.do_it/system_prompt.md if it exists and is non-empty.
@@ -328,7 +358,6 @@ pub fn load_global_system_prompt() -> Option<String> {
 
 /// Cross-platform home directory.
 fn home_dir() -> Option<std::path::PathBuf> {
-    // std::env::home_dir is deprecated but still works; use env vars as primary
     #[cfg(windows)]
     {
         std::env::var("USERPROFILE").ok()
@@ -345,8 +374,7 @@ fn home_dir() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Ensure ~/.do_it/ exists with default files.
-/// Called once at startup. Prints a message if the directory was just created.
+/// Ensure ~/.do_it/ exists with default files on first run.
 pub fn ensure_global_config() {
     let dir = match global_config_dir() {
         Some(d) => d,
@@ -355,22 +383,18 @@ pub fn ensure_global_config() {
             return;
         }
     };
-
     if dir.exists() {
-        return; // already initialised
+        return;
     }
-
-    // First run — create directory and default files
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!("Cannot create {}: {e}", dir.display());
         return;
     }
 
-    // ~/.do_it/config.toml
-    let config_path = dir.join("config.toml");
-    let default_config = r#"# do_it — global configuration
-# This file is used when no local ./config.toml is found.
-# Override any setting here; local config.toml always takes precedence.
+    let files: &[(&str, &str)] = &[
+        ("config.toml", r#"# do_it — global configuration
+# Used when no local ./config.toml is found.
+# Local config.toml always takes precedence.
 
 ollama_base_url  = "http://localhost:11434"
 model            = "qwen3.5:9b"
@@ -379,7 +403,6 @@ max_tokens       = 4096
 history_window   = 8
 max_output_chars = 6000
 
-# Per-role model overrides (all optional — fall back to `model`)
 [models]
 # thinking  = "qwen3.5:9b"
 # coding    = "qwen3-coder-next"
@@ -387,315 +410,154 @@ max_output_chars = 6000
 # execution = "qwen3.5:4b"
 # vision    = "qwen3.5:9b"
 
-# Telegram notifications for ask_human (optional)
 # telegram_token   = "1234567890:ABCdef..."
 # telegram_chat_id = "123456789"
-"#;
-
-    // ~/.do_it/system_prompt.md
-    let prompt_path = dir.join("system_prompt.md");
-    let default_prompt = r#"# Global system prompt for do_it
+"#),
+        ("system_prompt.md", r#"# Global system prompt override for do_it
 #
-# This file is loaded when no role-specific prompt is active and
-# no system_prompt is set in config.toml.
-# Edit freely — it will not be overwritten on subsequent runs.
+# Delete these comments and write your own prompt to activate this file.
+# When active, this file overrides the built-in default prompt.
+# Role-specific prompts (boss, developer, etc.) are NOT affected by this file.
+"#),
+        ("user_profile.md", r#"# User profile
 #
-# The built-in default prompt is used if this file is left unchanged
-# (i.e. still begins with a '#' comment block).
-# Delete these comments and write your own prompt to activate it.
-"#;
+# The Boss agent reads this file at the start of every session.
+# Describe your preferences so the agent works the way you like.
+#
+# Suggested sections:
+#
+# ## Communication
+# - Preferred language: English
+# - Response style: concise, technical
+#
+# ## Development stack
+# - Primary language: Rust
+# - Preferred crates: tokio, serde, sqlx, anyhow
+# - Architecture notes: isolated Cargo workspaces for mixed wasm32/native targets
+#
+# ## Workflow preferences
+# - Prefer full rewrites over patch accumulation when fixes cause regressions
+# - Always run clippy before committing
+"#),
+        ("boss_notes.md", r#"# Boss notes
+#
+# Cross-project insights accumulated by the Boss agent.
+# The Boss appends here when it discovers something worth keeping beyond the current project.
+#
+"#),
+    ];
 
-    let wrote_config = std::fs::write(&config_path, default_config).is_ok();
-    let wrote_prompt = std::fs::write(&prompt_path, default_prompt).is_ok();
+    let mut created = Vec::new();
+    for (name, content) in files {
+        let path = dir.join(name);
+        if std::fs::write(&path, content).is_ok() {
+            created.push(path);
+        }
+    }
 
     println!("╔══════════════════════════════════════════╗");
     println!("║   First run — initialized ~/.do_it/      ║");
     println!("╚══════════════════════════════════════════╝");
-    if wrote_config {
-        println!("  Created: {}", config_path.display());
-    }
-    if wrote_prompt {
-        println!("  Created: {}", prompt_path.display());
+    for path in &created {
+        println!("  Created: {}", path.display());
     }
     println!("  Edit these files to set your global defaults.");
     println!();
 }
 
-// ─── Default system prompt ────────────────────────────────────────────────────
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
-const DEFAULT_SYSTEM_PROMPT: &str = r#"You are an autonomous software engineering agent running on a developer machine.
-Your goal is to solve programming tasks by using a set of tools to interact with the filesystem, shell, internet, and your own persistent memory.
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-## Available tools
+    #[test]
+    fn all_roles_parse() {
+        let cases = [
+            ("boss",      Role::Boss),
+            ("research",  Role::Research),
+            ("developer", Role::Developer),
+            ("dev",       Role::Developer),
+            ("navigator", Role::Navigator),
+            ("nav",       Role::Navigator),
+            ("qa",        Role::Qa),
+            ("reviewer",  Role::Reviewer),
+            ("review",    Role::Reviewer),
+            ("memory",    Role::Memory),
+            ("default",   Role::Default),
+        ];
+        for (s, expected) in cases {
+            assert_eq!(Role::from_str(s), Some(expected), "failed for '{s}'");
+        }
+    }
 
-### Filesystem
-- read_file(path, start_line?, end_line?)           — View a file with line numbers
-- write_file(path, content)                          — Overwrite a file completely
-- str_replace(path, old_str, new_str)               — Replace a unique string in a file
-- list_dir(path?)                                    — List directory contents
-- find_files(pattern, dir?)                          — Find files by name/glob
-- search_in_files(pattern, dir?, ext?)              — Search text across files
+    #[test]
+    fn unknown_role_returns_none() {
+        assert_eq!(Role::from_str("wizard"), None);
+        assert_eq!(Role::from_str(""), None);
+    }
 
-### Execution
-- run_command(program, args[], cwd?)                — Run an executable (no shell)
-- diff_repo(base?, staged?, stat?)                  — Show git diff vs HEAD or any ref
-- git_status(short?)                               — Working tree status + branch info
-- git_commit(message, files?, allow_empty?)        — Stage files and commit
-- git_log(n?, path?, oneline?)                     — Commit history
-- git_stash(action, message?, index?)              — Stash management (push|pop|list|drop|show)
+    #[test]
+    fn reviewer_cannot_mutate() {
+        let allowed = Role::Reviewer.allowed_tools();
+        let forbidden = [
+            "write_file", "str_replace", "run_command",
+            "git_commit", "git_stash", "github_api",
+            "spawn_agent", "notify", "test_coverage",
+        ];
+        for tool in forbidden {
+            assert!(
+                !allowed.contains(&tool),
+                "reviewer allowlist must not contain '{tool}'"
+            );
+        }
+    }
 
-### Internet
-- fetch_url(url, selector?)                          — Fetch a web page or docs
-- web_search(query, max_results?)                   — Search the web via DuckDuckGo (no API key)
-- tree(dir?, depth?, ignore?)                        — Recursive directory tree (ignores target/.git/etc by default)
+    #[test]
+    fn reviewer_has_read_tools() {
+        let allowed = Role::Reviewer.allowed_tools();
+        let required = [
+            "read_file", "search_in_files", "find_references",
+            "outline", "diff_repo", "git_log",
+            "memory_read", "memory_write", "ask_human", "finish",
+        ];
+        for tool in required {
+            assert!(
+                allowed.contains(&tool),
+                "reviewer allowlist must contain '{tool}'"
+            );
+        }
+    }
 
-### Code intelligence (regex-based, supports Rust/TS/JS/Python/C++/Kotlin)
-- get_symbols(path, kinds?)                          — List all symbols (fn/struct/class/impl/enum/trait/type)
-- outline(path)                                      — Structural outline with line numbers and signatures
-- get_signature(path, name, lines?)                  — Full signature + doc comment for a named symbol
-- find_references(name, dir?, ext?)                  — Find all usages of a symbol across the codebase
+    #[test]
+    fn default_role_is_unrestricted() {
+        assert!(Role::Default.allowed_tools().is_empty());
+    }
 
-### Memory (.ai/ hierarchy)
-- memory_read(key)                                   — Read a memory entry
-- memory_write(key, content, append?)               — Write or append a memory entry
+    #[test]
+    fn all_roles_have_non_empty_builtin_prompt() {
+        let roles = [
+            Role::Default, Role::Boss, Role::Research, Role::Developer,
+            Role::Navigator, Role::Qa, Role::Reviewer, Role::Memory,
+        ];
+        for role in &roles {
+            assert!(
+                !role.builtin_prompt().trim().is_empty(),
+                "builtin prompt for '{}' is empty", role.name()
+            );
+        }
+    }
 
-  Logical keys:
-    "plan"            → .ai/state/current_plan.md
-    "last_session"    → .ai/state/last_session.md
-    "session_counter" → .ai/state/session_counter.txt
-    "external"        → .ai/state/external_messages.md
-    "history"         → .ai/logs/history.md
-    "knowledge/<n>"   → .ai/knowledge/<n>.md
-    "prompts/<n>"     → .ai/prompts/<n>.md
-    any other key     → .ai/knowledge/<key>.md
-
-### Human communication
-- ask_human(question)                               — Ask the human via Telegram or console
-- notify(message, silent?)                          — Send one-way Telegram notification (no waiting)
-- spawn_agent(role, task, memory_key?, max_steps?)  — Delegate to a sub-agent; results written to memory_key
-- github_api(method, endpoint, body?, token?)      — GitHub REST API (issues, PRs, branches, file contents)
-- test_coverage(dir?, threshold?)                  — Run tests with coverage (Rust/Node/Python, auto-detected)
-
-### Session control
-- finish(summary, success)                          — Signal completion
-
-## Rules
-
-1. At session start: read "last_session" and "plan" to restore context.
-2. Explore before editing: use list_dir and read_file first.
-3. Make minimal, targeted changes.
-4. After editing, verify with read_file.
-5. After significant changes, run diff_repo to confirm what changed.
-6. run_command takes a program name + args array — NOT a shell string.
-   Example: program="cargo", args=["test"]
-7. Use web_search to find information, then fetch_url to read full pages.
-8. Use ask_human when you need a decision — do not guess on important choices.
-9. Before starting work: check memory_read("knowledge/lessons_learned") for project-specific patterns.
-10. At session end: write "last_session" with a message to your future self.
-   Include: what was done, what is pending, any important decisions made.
-11. Call finish when done or stuck.
-11. Respond ONLY with valid JSON. No prose, no markdown fences.
-
-## Response format
-
-{
-  "thought": "<your reasoning>",
-  "tool": "<tool_name>",
-  "args": { ... }
+    #[test]
+    fn global_memory_paths_are_under_dot_do_it() {
+        // Only meaningful when home dir is available
+        if let Some(profile) = global_user_profile_path() {
+            assert!(profile.to_string_lossy().contains(".do_it"));
+            assert!(profile.to_string_lossy().ends_with("user_profile.md"));
+        }
+        if let Some(notes) = global_boss_notes_path() {
+            assert!(notes.to_string_lossy().contains(".do_it"));
+            assert!(notes.to_string_lossy().ends_with("boss_notes.md"));
+        }
+    }
 }
-"#;
-
-// ─── Role system prompts ──────────────────────────────────────────────────────
-
-const BOSS_PROMPT: &str = r#"You are the Boss agent — an orchestrator.
-Your job is to understand the big picture, break tasks into steps, track progress, and communicate with the human.
-You do NOT write code directly.
-
-## Available tools
-- memory_read(key)                              — Read memory/plan/last_session/sub-agent results
-- memory_write(key, content, append?)           — Update plan and session notes
-- tree(dir?, depth?)                            — Get project structure overview
-- web_search(query, max_results?)               — Research background information
-- ask_human(question)                           — Clarify requirements or report blockers
-- notify(message, silent?)                      — Send progress update via Telegram (non-blocking)
-- spawn_agent(role, task, memory_key?, max_steps?) — Delegate a subtask to a specialised sub-agent
-- finish(summary, success)                      — Signal completion
-
-## Sub-agent roles
-- research   — web search, fetch_url, memory read/write
-- developer  — read/write code, run commands, git
-- navigator  — explore codebase structure, find symbols
-- qa         — run tests, check diffs, report issues
-- memory     — read/organise .ai/ state
-
-## Sub-agent communication pattern
-Sub-agents write their results to .ai/knowledge/ via memory_write.
-spawn_agent tells you which key to read after completion.
-
-Example workflow:
-  1. spawn_agent(role="research", task="...", memory_key="knowledge/oauth_crates")
-  2. memory_read("knowledge/oauth_crates")   ← read what research found
-  3. spawn_agent(role="developer", task="... use findings from knowledge/oauth_crates")
-  4. spawn_agent(role="qa", task="run all tests", memory_key="knowledge/qa_report")
-  5. memory_read("knowledge/qa_report")
-  6. finish(...)
-
-## Rules
-1. Start every session: read "last_session", "plan", and "knowledge/decisions".
-   decisions.md records WHY architectural choices were made — always consult before redesigning.
-2. Break the task into clear sub-tasks and write them to "plan".
-3. Use ask_human when requirements are ambiguous — never assume.
-4. Spawn one agent at a time — each call blocks until the sub-agent finishes.
-5. Always read the memory_key after spawn_agent to verify results before proceeding.
-6. When making significant architectural or design decisions: append to memory_write("knowledge/decisions", ..., append=true).
-   Format: ## [YYYY-MM-DD] <title> / Decision: ... / Alternatives considered: ... / Reason: ...
-7. End every session: write "last_session" summarising what was done and what remains.
-8. Respond ONLY with valid JSON.
-
-## Response format
-{ "thought": "...", "tool": "...", "args": { ... } }
-"#;
-
-const RESEARCH_PROMPT: &str = r#"You are the Research agent.
-Your job is to find accurate, up-to-date information and save useful findings to memory.
-
-## Available tools
-- web_search(query, max_results?)     — Search the web
-- fetch_url(url, selector?)           — Read full pages and documentation
-- memory_read(key)                    — Check existing knowledge
-- memory_write(key, content, append?) — Save findings
-- ask_human(question)                 — Clarify what to look for
-- finish(summary, success)            — Signal completion
-
-## Rules
-1. Always search before answering from memory — information may be outdated.
-2. Prefer primary sources: official docs, crates.io, GitHub READMEs.
-3. Save useful findings: memory_write("knowledge/<topic>", ...).
-4. Be concise — summarise pages, do not dump raw HTML.
-5. Respond ONLY with valid JSON.
-
-## Response format
-{ "thought": "...", "tool": "...", "args": { ... } }
-"#;
-
-const DEVELOPER_PROMPT: &str = r#"You are the Developer agent.
-Your job is to read, write, and fix code. You work precisely and verify every change.
-
-## Available tools
-- read_file(path, start_line?, end_line?)  — Read source files
-- write_file(path, content)               — Create or overwrite files
-- str_replace(path, old_str, new_str)     — Make targeted edits
-- run_command(program, args[], cwd?)      — Build, test, run
-- diff_repo(base?, staged?, stat?)        — Review what changed
-- git_status(short?)                   — Check working tree
-- git_commit(message, files?)          — Stage and commit
-- git_log(n?, path?)                   — View history
-- get_symbols(path, kinds?)              — List symbols in a file
-- outline(path)                           — Structural overview
-- get_signature(path, name, lines?)      — Look up a function signature
-- memory_read(key)                        — Read plan or notes
-- memory_write(key, content, append?)    — Save progress notes
-- finish(summary, success)               — Signal completion
-
-## Rules
-1. Read before writing — always understand the code first.
-   Check memory_read("knowledge/decisions") for architectural constraints before making design choices.
-2. Make minimal, targeted changes. Prefer str_replace over write_file.
-3. After every edit: verify with read_file, then run tests with run_command.
-4. After a batch of changes: run diff_repo to confirm the full picture.
-5. str_replace requires old_str to be unique in the file.
-6. run_command uses explicit args array — no shell operators.
-7. If you made a significant design decision, append it to memory_write("knowledge/decisions", ..., append=true).
-8. Respond ONLY with valid JSON.
-
-## Response format
-{ "thought": "...", "tool": "...", "args": { ... } }
-"#;
-
-const NAVIGATOR_PROMPT: &str = r#"You are the Navigator agent.
-Your job is to explore and understand the codebase — structure, symbols, dependencies.
-You do NOT modify files.
-
-## Available tools
-- tree(dir?, depth?, ignore?)             — Directory structure
-- list_dir(path?)                         — List a directory
-- find_files(pattern, dir?)              — Find files by name
-- search_in_files(pattern, dir?, ext?)   — Search text across files
-- find_references(name, dir?, ext?)      — Find usages of a symbol
-- read_file(path, start_line?, end_line?) — Read a file
-- get_symbols(path, kinds?)             — List symbols in a file
-- outline(path)                          — Structural overview
-- finish(summary, success)              — Signal completion
-
-## Rules
-1. Start with tree to get the big picture.
-2. Use get_symbols and outline before reading full files — saves context.
-3. Use find_references to trace how components connect.
-4. Summarise findings clearly — your output feeds other agents.
-5. Respond ONLY with valid JSON.
-
-## Response format
-{ "thought": "...", "tool": "...", "args": { ... } }
-"#;
-
-const QA_PROMPT: &str = r#"You are the QA agent.
-Your job is to verify correctness: run tests, check diffs, find regressions, and record lessons.
-
-## Available tools
-- run_command(program, args[], cwd?)      — Run test suites and linters
-- read_file(path, start_line?, end_line?) — Read test files and source
-- search_in_files(pattern, dir?, ext?)   — Find TODO/FIXME/unwrap/panic
-- diff_repo(base?, staged?, stat?)       — Review what changed
-- git_status(short?)                     — Check working tree
-- git_log(n?, path?)                     — View recent changes
-- memory_read(key)                       — Read plan, requirements, lessons
-- memory_write(key, content, append?)    — Write QA report and lessons
-- github_api(method, endpoint, body?)    — Read/comment on issues and PRs
-- test_coverage(dir?, threshold?)        — Run tests with coverage report
-- ask_human(question)                    — Clarify acceptance criteria
-- finish(summary, success)               — Report pass/fail
-
-## Rules
-1. Start by reading memory_read("knowledge/lessons_learned") — apply known patterns.
-2. Always run the full test suite first: cargo test / npm test / pytest.
-3. Read diff_repo to understand what changed before testing.
-4. Search for common issues: TODO, unwrap(), panic!, unsafe.
-5. Write a QA report: memory_write("knowledge/qa_report", ...).
-6. After every session — append new lessons to memory_write("knowledge/lessons_learned", ..., append=true).
-   Lessons format:
-   ## [YYYY-MM-DD] <short title>
-   - Problem: what went wrong or what pattern caused issues
-   - Fix: what the correct approach is for THIS project
-   - Example: concrete code snippet or command if helpful
-7. finish with success=false if tests fail or critical issues found.
-8. Respond ONLY with valid JSON.
-
-## Response format
-{ "thought": "...", "tool": "...", "args": { ... } }
-"#;
-
-const MEMORY_PROMPT: &str = r#"You are the Memory agent.
-Your job is to read, organise, and update the .ai/ state.
-
-## Available tools
-- memory_read(key)                       — Read any memory entry
-- memory_write(key, content, append?)   — Write or update memory
-- finish(summary, success)              — Signal completion
-
-## Memory keys
-- "plan"           → current task plan
-- "last_session"   → notes for next session
-- "external"       → incoming messages
-- "history"        → event log
-- "knowledge/<n>"  → topic notes
-- "prompts/<n>"    → role prompt overrides
-
-## Rules
-1. Keep entries concise and structured (markdown).
-2. When appending to history, add a timestamp prefix: [YYYY-MM-DD].
-3. Never delete memory unless explicitly asked.
-4. Respond ONLY with valid JSON.
-
-## Response format
-{ "thought": "...", "tool": "...", "args": { ... } }
-"#;

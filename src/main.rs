@@ -36,7 +36,7 @@ enum Commands {
         config: String,
 
         /// Agent role — restricts tool set and sets role-specific system prompt.
-        /// Roles: boss, research, developer, navigator, qa, memory
+        /// Roles: boss, research, developer, navigator, qa, reviewer, memory
         /// (default: unrestricted)
         #[arg(long)]
         role: Option<String>,
@@ -147,6 +147,7 @@ fn print_roles() {
         Role::Developer,
         Role::Navigator,
         Role::Qa,
+        Role::Reviewer,
         Role::Memory,
     ];
 
