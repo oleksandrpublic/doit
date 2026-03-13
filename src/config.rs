@@ -63,6 +63,44 @@ impl ModelRole {
     }
 }
 
+// ─── Browser configuration ────────────────────────────────────────────────────
+
+/// Optional headless browser backend.
+/// When absent, all browser tools return a "not configured" error.
+///
+/// Two mutually exclusive modes:
+///   cdp_url    — connect to an already-running CDP server (Lightpanda, remote Chrome, etc.)
+///   chrome_path — launch Chrome/Chromium locally via chromiumoxide
+///
+/// If both are set, cdp_url takes precedence.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BrowserConfig {
+    /// WebSocket CDP endpoint, e.g. "ws://127.0.0.1:9222"
+    #[serde(default)]
+    pub cdp_url: Option<String>,
+    /// Path to Chrome/Chromium executable for local launch
+    #[serde(default)]
+    pub chrome_path: Option<String>,
+    /// Directory where screenshots are saved (default: .ai/screenshots)
+    #[serde(default)]
+    pub screenshot_dir: Option<String>,
+}
+
+impl BrowserConfig {
+    /// Returns true if any browser backend is configured.
+    pub fn is_configured(&self) -> bool {
+        self.cdp_url.is_some() || self.chrome_path.is_some()
+    }
+
+    /// Returns the effective screenshot directory.
+    pub fn effective_screenshot_dir(&self, repo_root: &std::path::Path) -> std::path::PathBuf {
+        match &self.screenshot_dir {
+            Some(d) => std::path::PathBuf::from(d),
+            None    => repo_root.join(".ai/screenshots"),
+        }
+    }
+}
+
 // ─── Built-in prompts (compiled into the binary) ──────────────────────────────
 //
 // Each role has a corresponding src/prompts/<role>.md file.
@@ -142,7 +180,14 @@ impl Role {
             Self::Boss => &[
                 "memory_read", "memory_write",
                 "tree", "ask_human", "web_search",
-                "spawn_agent", "notify",
+                "spawn_agent", "spawn_agents", "notify",
+                // background processes — for running dev servers before screenshots
+                "run_background", "process_status", "process_kill", "process_list",
+                // browser — requires [browser] in config.toml
+                "screenshot", "browser_get_text",
+                "browser_action", "browser_navigate",
+                // agent self-improvement
+                "tool_request", "capability_gap",
                 "finish",
             ],
 
@@ -156,9 +201,16 @@ impl Role {
                 "read_file", "write_file", "str_replace",
                 "run_command", "diff_repo",
                 "git_status", "git_commit", "git_log", "git_stash",
+                // git_pull: always safe. git_push: REQUIRES user consent (built into the tool).
+                "git_pull", "git_push",
                 "get_symbols", "outline", "get_signature", "find_references",
                 "memory_read", "memory_write",
                 "github_api", "test_coverage", "notify",
+                // background processes — start dev servers, check them, stop them
+                "run_background", "process_status", "process_kill", "process_list",
+                // browser — for visual verification after UI changes
+                "screenshot", "browser_get_text",
+                "browser_action", "browser_navigate",
                 "finish",
             ],
 
@@ -173,19 +225,27 @@ impl Role {
                 "run_command", "read_file",
                 "search_in_files", "diff_repo",
                 "git_status", "git_log",
+                // git_pull: safe read-only sync; no git_push for QA
+                "git_pull",
                 "memory_read", "memory_write",
                 "ask_human", "github_api", "test_coverage", "notify",
+                // browser — for visual regression checks
+                "screenshot", "browser_get_text",
                 "finish",
             ],
 
             // Reviewer: read-only. No write_file, str_replace, run_command,
-            // git_commit, git_stash, spawn_agent, notify, test_coverage, github_api.
+            // git_commit, git_stash, git_push, spawn_agent, notify, test_coverage, github_api.
             Self::Reviewer => &[
                 "read_file", "search_in_files", "find_references",
                 "get_symbols", "outline", "get_signature",
                 "diff_repo", "git_log",
+                // git_pull: safe, allows reviewer to see latest code
+                "git_pull",
                 "memory_read", "memory_write",
                 "ask_human",
+                // browser — read-only visual inspection only
+                "screenshot", "browser_get_text",
                 "finish",
             ],
 
@@ -242,6 +302,11 @@ pub struct AgentConfig {
     pub history_window: usize,
     /// Truncate tool output to this many chars before sending to LLM
     pub max_output_chars: usize,
+    /// Max depth for nested spawn_agent calls (prevents runaway recursion)
+    /// depth=0 is the top-level agent; sub-agents increment this counter.
+    /// When depth >= max_depth, spawn_agent and spawn_agents are refused.
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
     /// System prompt (default role only — roles override this via Role::system_prompt)
     pub system_prompt: String,
     /// Telegram bot token for ask_human / notifications (optional)
@@ -250,7 +315,12 @@ pub struct AgentConfig {
     /// Telegram chat_id to send messages to (optional)
     #[serde(default)]
     pub telegram_chat_id: Option<String>,
+    /// Optional headless browser backend (CDP or local Chrome)
+    #[serde(default)]
+    pub browser: BrowserConfig,
 }
+
+fn default_max_depth() -> usize { 3 }
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -262,9 +332,11 @@ impl Default for AgentConfig {
             max_tokens: 4096,
             history_window: 8,
             max_output_chars: 6000,
+            max_depth: 3,
             system_prompt: PROMPT_DEFAULT.to_string(),
             telegram_token: None,
             telegram_chat_id: None,
+            browser: BrowserConfig::default(),
         }
     }
 }
@@ -348,6 +420,11 @@ pub fn global_user_profile_path() -> Option<std::path::PathBuf> {
 /// Returns ~/.do_it/boss_notes.md
 pub fn global_boss_notes_path() -> Option<std::path::PathBuf> {
     global_config_dir().map(|d| d.join("boss_notes.md"))
+}
+
+/// Returns ~/.do_it/tool_wishlist.md
+pub fn global_tool_wishlist_path() -> Option<std::path::PathBuf> {
+    global_config_dir().map(|d| d.join("tool_wishlist.md"))
 }
 
 /// Load ~/.do_it/system_prompt.md if it exists and is non-empty.
@@ -445,6 +522,13 @@ max_output_chars = 6000
 # The Boss appends here when it discovers something worth keeping beyond the current project.
 #
 "#),
+        ("tool_wishlist.md", r#"# Tool wishlist
+#
+# Agent-requested capabilities, written automatically by the Boss via tool_request and capability_gap.
+# Each entry describes a missing tool or observed limitation encountered during real tasks.
+# Review this file to prioritise new tool development.
+#
+"#),
     ];
 
     let mut created = Vec::new();
@@ -503,7 +587,9 @@ mod tests {
         let forbidden = [
             "write_file", "str_replace", "run_command",
             "git_commit", "git_stash", "github_api",
-            "spawn_agent", "notify", "test_coverage",
+            "spawn_agent", "spawn_agents", "notify", "test_coverage",
+            // wishlist tools not for reviewer
+            "tool_request", "capability_gap",
         ];
         for tool in forbidden {
             assert!(
@@ -519,7 +605,9 @@ mod tests {
         let required = [
             "read_file", "search_in_files", "find_references",
             "outline", "diff_repo", "git_log",
-            "memory_read", "memory_write", "ask_human", "finish",
+            "memory_read", "memory_write", "ask_human",
+            "screenshot", "browser_get_text",
+            "finish",
         ];
         for tool in required {
             assert!(
@@ -549,8 +637,55 @@ mod tests {
     }
 
     #[test]
+    fn boss_has_browser_and_wishlist_tools() {
+        let allowed = Role::Boss.allowed_tools();
+        let required = [
+            "screenshot", "browser_get_text", "browser_action", "browser_navigate",
+            "tool_request", "capability_gap",
+        ];
+        for tool in required {
+            assert!(allowed.contains(&tool), "boss allowlist must contain '{tool}'");
+        }
+    }
+
+    #[test]
+    fn developer_has_browser_tools() {
+        let allowed = Role::Developer.allowed_tools();
+        let required = ["screenshot", "browser_get_text", "browser_action", "browser_navigate"];
+        for tool in required {
+            assert!(allowed.contains(&tool), "developer allowlist must contain '{tool}'");
+        }
+    }
+
+    #[test]
+    fn qa_has_browser_read_tools_only() {
+        let allowed = Role::Qa.allowed_tools();
+        assert!(allowed.contains(&"screenshot"));
+        assert!(allowed.contains(&"browser_get_text"));
+        // QA does not interact — no actions
+        assert!(!allowed.contains(&"browser_action"));
+        assert!(!allowed.contains(&"browser_navigate"));
+    }
+
+    #[test]
+    fn default_max_depth_is_three() {
+        let cfg = AgentConfig::default();
+        assert_eq!(cfg.max_depth, 3);
+    }
+
+    #[test]
+    fn browser_config_is_configured() {
+        let mut b = BrowserConfig::default();
+        assert!(!b.is_configured());
+        b.cdp_url = Some("ws://127.0.0.1:9222".to_string());
+        assert!(b.is_configured());
+        b.cdp_url = None;
+        b.chrome_path = Some("/usr/bin/chromium".to_string());
+        assert!(b.is_configured());
+    }
+
+    #[test]
     fn global_memory_paths_are_under_dot_do_it() {
-        // Only meaningful when home dir is available
         if let Some(profile) = global_user_profile_path() {
             assert!(profile.to_string_lossy().contains(".do_it"));
             assert!(profile.to_string_lossy().ends_with("user_profile.md"));
@@ -558,6 +693,10 @@ mod tests {
         if let Some(notes) = global_boss_notes_path() {
             assert!(notes.to_string_lossy().contains(".do_it"));
             assert!(notes.to_string_lossy().ends_with("boss_notes.md"));
+        }
+        if let Some(wishlist) = global_tool_wishlist_path() {
+            assert!(wishlist.to_string_lossy().contains(".do_it"));
+            assert!(wishlist.to_string_lossy().ends_with("tool_wishlist.md"));
         }
     }
 }

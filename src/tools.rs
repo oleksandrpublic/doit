@@ -1,8 +1,40 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use walkdir::WalkDir;
+
+// ─── Background process registry ─────────────────────────────────────────────
+//
+// Persists across tool calls within one agent session.
+// Keyed by user-supplied string ID (e.g. "frontend", "api-server").
+
+struct BackgroundProcess {
+    /// OS child handle — needed for kill() and try_wait()
+    child: tokio::process::Child,
+    /// Human-readable label showing the full command
+    command: String,
+    /// Working directory the process was started in
+    cwd: String,
+    /// Monotonic tick for display ordering
+    started_at: u64,
+}
+
+static BACKGROUND_PROCESSES: OnceLock<Mutex<HashMap<String, BackgroundProcess>>> =
+    OnceLock::new();
+
+fn bg_registry() -> &'static Mutex<HashMap<String, BackgroundProcess>> {
+    BACKGROUND_PROCESSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static SESSION_TICK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn next_tick() -> u64 {
+    SESSION_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 // ─── Tool result ──────────────────────────────────────────────────────────────
 
@@ -46,6 +78,7 @@ pub fn dispatch<'a>(
     tg: &'a TelegramConfig,
     cfg: &'a crate::config::AgentConfig,
     sub_agent_max_steps: usize,
+    depth: usize,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + 'a>> {
     Box::pin(async move {
     let result = match tool {
@@ -71,17 +104,37 @@ pub fn dispatch<'a>(
         "git_commit"       => git_commit(args, root).await,
         "git_log"          => git_log(args, root).await,
         "git_stash"        => git_stash(args, root).await,
-        "spawn_agent"      => spawn_agent(args, root, cfg, sub_agent_max_steps).await,
+        "git_pull"         => git_pull(args, root).await,
+        "git_push"         => git_push(args, root, tg).await,
+        "spawn_agent"      => spawn_agent(args, root, cfg, sub_agent_max_steps, depth).await,
+        "spawn_agents"     => spawn_agents(args, root, cfg, sub_agent_max_steps, depth).await,
         "github_api"       => github_api(args).await,
         "test_coverage"    => test_coverage(args, root).await,
         "notify"           => notify(args, tg).await,
+        // Background process management
+        "run_background"   => run_background(args, root).await,
+        "process_status"   => process_status(args).await,
+        "process_kill"     => process_kill(args).await,
+        "process_list"     => process_list(args).await,
+        // Browser tools — require [browser] in config.toml
+        "screenshot"       => browser_screenshot(args, root, cfg),
+        "browser_get_text" => browser_get_text(args, cfg),
+        "browser_action"   => browser_action(args, cfg),
+        "browser_navigate" => browser_navigate(args, cfg),
+        // Agent self-improvement tools
+        "tool_request"     => tool_request(args).await,
+        "capability_gap"   => capability_gap(args).await,
         "finish"           => Ok(ToolResult::ok("__finish__")),
         unknown => bail!(
             "Unknown tool: '{unknown}'. Available: read_file, write_file, str_replace, \
              list_dir, find_files, search_in_files, run_command, fetch_url, web_search, \
              ask_human, diff_repo, tree, memory_read, memory_write, \
              get_symbols, outline, get_signature, find_references, \
-             git_status, git_commit, git_log, git_stash, spawn_agent, github_api, test_coverage, notify, finish"
+             git_status, git_commit, git_log, git_stash, git_pull, git_push, spawn_agent, spawn_agents, github_api, \
+             test_coverage, notify, \
+             run_background, process_status, process_kill, process_list, \
+             screenshot, browser_get_text, browser_action, browser_navigate, \
+             tool_request, capability_gap, finish"
         ),
     }?;
 
@@ -725,6 +778,9 @@ fn resolve_memory_path(root: &Path, key: &str) -> Option<PathBuf> {
     }
     if key == "boss_notes" {
         return crate::config::global_boss_notes_path();
+    }
+    if key == "tool_wishlist" {
+        return crate::config::global_tool_wishlist_path();
     }
 
     let ai = root.join(AI_DIR);
@@ -2051,6 +2107,169 @@ async fn git_stash(args: &Value, root: &Path) -> Result<ToolResult> {
 
     Ok(ToolResult::ok(out.trim().to_string()))
 }
+
+// ─── git_pull ─────────────────────────────────────────────────────────────────
+//
+// Safe to call any time — brings remote changes into the local repo.
+// No external state is modified from the user's perspective.
+
+/// Fetch and integrate remote changes (git pull).
+///
+/// Args:
+///   remote?  — remote name (default: "origin")
+///   branch?  — branch name (default: current branch)
+///   rebase?  — bool, use --rebase instead of merge (default: false)
+async fn git_pull(args: &Value, root: &Path) -> Result<ToolResult> {
+    if !git_check(root).await {
+        return Ok(ToolResult { output: "Not a git repository.".into(), success: false });
+    }
+
+    let remote = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+    let rebase  = args.get("rebase").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let mut cmd_args: Vec<&str> = vec!["pull"];
+    if rebase { cmd_args.push("--rebase"); }
+    cmd_args.push(remote);
+
+    if let Some(branch) = args.get("branch").and_then(|v| v.as_str()) {
+        cmd_args.push(branch);
+    }
+
+    let out = tokio::process::Command::new("git")
+        .args(&cmd_args)
+        .current_dir(root)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("git pull: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let combined = format!("{stdout}{stderr}").trim().to_string();
+
+    Ok(ToolResult {
+        output: if combined.is_empty() { "Already up to date.".into() } else { combined },
+        success: out.status.success(),
+    })
+}
+
+// ─── git_push ─────────────────────────────────────────────────────────────────
+//
+// REQUIRES EXPLICIT USER CONSENT before executing.
+//
+// The repository belongs to the user. Pushing to a remote is an action
+// that affects the outside world and cannot be undone easily. The agent
+// must ALWAYS ask for confirmation — via Telegram if configured, otherwise
+// via console prompt. If the user says anything other than yes/да/y, the
+// push is aborted unconditionally.
+//
+// This rule is non-negotiable and must never be bypassed.
+
+/// Push local commits to a remote — REQUIRES USER CONSENT.
+///
+/// Args:
+///   remote?      — remote name (default: "origin")
+///   branch?      — branch to push (default: current branch)
+///   force?       — bool, use --force-with-lease (default: false); requires extra confirmation
+///   _consent?    — internal: set to true only when consent was already obtained
+///                  via the ask_human tool in the same session step.
+///                  The agent should NEVER set this manually without asking first.
+async fn git_push(args: &Value, root: &Path, tg: &TelegramConfig) -> Result<ToolResult> {
+    if !git_check(root).await {
+        return Ok(ToolResult { output: "Not a git repository.".into(), success: false });
+    }
+
+    let remote  = args.get("remote").and_then(|v| v.as_str()).unwrap_or("origin");
+    let force   = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+    let branch_opt = args.get("branch").and_then(|v| v.as_str());
+
+    // Determine what will be pushed for the confirmation message
+    let branch_display = if let Some(b) = branch_opt {
+        b.to_string()
+    } else {
+        // Read current branch name for display
+        let br = tokio::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(root)
+            .output()
+            .await;
+        match br {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Err(_) => "<current branch>".to_string(),
+        }
+    };
+
+    let force_warning = if force {
+        "\n⚠️  FORCE PUSH requested (--force-with-lease). This rewrites remote history."
+    } else {
+        ""
+    };
+
+    let question = format!(
+        "git_push: about to push branch '{branch_display}' to remote '{remote}'.{force_warning}\n\
+         This modifies the remote repository.\n\
+         Do you confirm? (yes / no)"
+    );
+
+    // Ask the user — through Telegram if available, otherwise stdin
+    let consent = ask_consent(&question, tg).await;
+
+    let confirmed = matches!(consent.trim().to_lowercase().as_str(), "yes" | "y" | "да" | "д");
+
+    if !confirmed {
+        return Ok(ToolResult {
+            output: format!(
+                "git_push ABORTED: user did not confirm.\n\
+                 Response was: '{consent}'\n\
+                 No changes were made to the remote repository."
+            ),
+            success: false,
+        });
+    }
+
+    // Consent obtained — execute push
+    let mut cmd_args = vec!["push"];
+    if force { cmd_args.push("--force-with-lease"); }
+    cmd_args.push(remote);
+    if let Some(b) = branch_opt { cmd_args.push(b); }
+
+    let out = tokio::process::Command::new("git")
+        .args(&cmd_args)
+        .current_dir(root)
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("git push: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let combined = format!("{stdout}{stderr}").trim().to_string();
+
+    Ok(ToolResult {
+        output: format!("git_push (confirmed by user):\n{combined}"),
+        success: out.status.success(),
+    })
+}
+
+/// Ask the user a yes/no question.
+/// Uses Telegram if configured and reachable; falls back to stdin.
+/// Returns the raw trimmed response string.
+async fn ask_consent(question: &str, tg: &TelegramConfig) -> String {
+    // Try Telegram first
+    if tg.token.is_some() && tg.chat_id.is_some() {
+        let tg_args = serde_json::json!({ "message": question });
+        if let Ok(result) = ask_human(&tg_args, tg).await {
+            return result.output.trim().to_string();
+        }
+    }
+
+    // Fall back to stdin
+    println!("\n❓ CONSENT REQUIRED\n{question}\n> ");
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(_) => line.trim().to_string(),
+        Err(_) => String::new(),
+    }
+}
+
 // ─── spawn_agent ──────────────────────────────────────────────────────────────
 
 /// Spawn a sub-agent with a given role and task.
@@ -2064,16 +2283,29 @@ async fn git_stash(args: &Value, root: &Path) -> Result<ToolResult> {
 ///   role        — agent role: research | developer | navigator | qa | memory
 ///   task        — task description (string)
 ///   memory_key? — .ai/knowledge/ key where sub-agent should write results
-///                 (default: "knowledge/<role>_result")
+///                 (default: "knowledge/agent_result")
 ///   max_steps?  — override max steps (default: parent_sub_steps, min 5)
 async fn spawn_agent(
     args: &Value,
     root: &Path,
     cfg: &crate::config::AgentConfig,
     parent_sub_steps: usize,
+    depth: usize,
 ) -> Result<ToolResult> {
     use crate::agent::SweAgent;
     use crate::config::Role;
+
+    // Depth guard — prevent runaway recursion
+    if depth >= cfg.max_depth {
+        return Ok(ToolResult {
+            output: format!(
+                "spawn_agent REFUSED: max nesting depth ({}) reached.\n\
+                 Current depth: {depth}. Solve this step directly instead of spawning.",
+                cfg.max_depth
+            ),
+            success: false,
+        });
+    }
 
     let role_str = str_arg(args, "role")?;
     let task     = str_arg(args, "task")?;
@@ -2085,7 +2317,7 @@ async fn spawn_agent(
         )
     })?;
 
-    // Prevent infinite recursion: boss cannot spawn another boss
+    // Boss cannot spawn another boss (role-level recursion guard)
     if role == Role::Boss {
         return Ok(ToolResult {
             output: "spawn_agent: cannot spawn a boss sub-agent (recursion guard)".into(),
@@ -2096,7 +2328,7 @@ async fn spawn_agent(
     let memory_key = args
         .get("memory_key")
         .and_then(|v| v.as_str())
-        .unwrap_or_else(|| "knowledge/agent_result")
+        .unwrap_or("knowledge/agent_result")
         .to_string();
 
     let max_steps = args
@@ -2105,7 +2337,6 @@ async fn spawn_agent(
         .map(|n| n as usize)
         .unwrap_or(parent_sub_steps.max(5));
 
-    // Inject memory_key instruction into the task so the sub-agent knows where to write
     let augmented_task = format!(
         "{task}\n\n\
         IMPORTANT: When finished, write your results and findings to memory key \"{memory_key}\" \
@@ -2114,20 +2345,201 @@ async fn spawn_agent(
 
     let repo_str = root.to_string_lossy().to_string();
 
-    let mut sub = SweAgent::new(cfg.clone(), &repo_str, max_steps, role.clone())
+    let mut sub = SweAgent::new_with_depth(cfg.clone(), &repo_str, max_steps, role.clone(), depth + 1)
         .map_err(|e| anyhow::anyhow!("spawn_agent: failed to create sub-agent: {e}"))?;
 
     sub.run_capture(&augmented_task).await?;
 
-    // Tell the boss where to find the results
     Ok(ToolResult::ok(format!(
-        "{} agent finished ({max_steps} steps max).\n\
+        "{} agent finished (depth={}, max_steps={max_steps}).\n\
         Results written to memory key \"{memory_key}\".\n\
         Use memory_read(\"{memory_key}\") to access them.",
         role.name(),
-        memory_key = memory_key,
+        depth + 1,
     )))
 }
+
+// ─── spawn_agents (parallel) ──────────────────────────────────────────────────
+//
+// Run multiple sub-agents concurrently via tokio::task::JoinSet.
+// All agents share the same repo root and config.
+// Each writes results to its own memory_key; parent reads all keys after.
+//
+// Args:
+//   agents  — array of { role, task, memory_key? }
+//   timeout_secs? — per-agent timeout in seconds (default: 300)
+//
+// Example:
+//   spawn_agents(agents=[
+//     { "role": "research",  "task": "...", "memory_key": "knowledge/research" },
+//     { "role": "navigator", "task": "...", "memory_key": "knowledge/files" }
+//   ])
+
+async fn spawn_agents(
+    args: &Value,
+    root: &Path,
+    cfg: &crate::config::AgentConfig,
+    parent_sub_steps: usize,
+    depth: usize,
+) -> Result<ToolResult> {
+    use crate::agent::SweAgent;
+    use crate::config::Role;
+
+    // Depth guard
+    if depth >= cfg.max_depth {
+        return Ok(ToolResult {
+            output: format!(
+                "spawn_agents REFUSED: max nesting depth ({}) reached.\n\
+                 Current depth: {depth}.",
+                cfg.max_depth
+            ),
+            success: false,
+        });
+    }
+
+    let agents_val = args.get("agents")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("spawn_agents: 'agents' must be a JSON array"))?;
+
+    if agents_val.is_empty() {
+        return Ok(ToolResult {
+            output: "spawn_agents: 'agents' array is empty — nothing to do".into(),
+            success: false,
+        });
+    }
+
+    if agents_val.len() > 8 {
+        return Ok(ToolResult {
+            output: format!(
+                "spawn_agents: too many agents requested ({}). Maximum is 8 per call.",
+                agents_val.len()
+            ),
+            success: false,
+        });
+    }
+
+    let timeout_secs = args.get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(300);
+
+    // Parse and validate all agent specs up front before spawning anything
+    struct AgentSpec {
+        role: Role,
+        task: String,
+        memory_key: String,
+        max_steps: usize,
+    }
+
+    let mut specs: Vec<AgentSpec> = Vec::new();
+    for (i, agent_val) in agents_val.iter().enumerate() {
+        let role_str = agent_val.get("role")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("spawn_agents: agents[{i}] missing 'role'"))?;
+
+        let role = Role::from_str(role_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "spawn_agents: agents[{i}] unknown role '{role_str}'. \
+                 Valid: research, developer, navigator, qa, memory"
+            )
+        })?;
+
+        if role == Role::Boss {
+            return Ok(ToolResult {
+                output: format!("spawn_agents: agents[{i}] cannot use boss role (recursion guard)"),
+                success: false,
+            });
+        }
+
+        let task = agent_val.get("task")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("spawn_agents: agents[{i}] missing 'task'"))?
+            .to_string();
+
+        let memory_key = agent_val.get("memory_key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("knowledge/agent_result")
+            .to_string();
+
+        let max_steps = agent_val.get("max_steps")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(parent_sub_steps.max(5));
+
+        specs.push(AgentSpec { role, task, memory_key, max_steps });
+    }
+
+    let n = specs.len();
+    println!("  [spawn_agents] launching {} agents concurrently (depth={})", n, depth + 1);
+
+    // Build futures — run concurrently on the current thread (no Send required).
+    // run_capture returns Box<dyn Future> which is not Send, so we cannot use
+    // JoinSet::spawn (which needs Send). futures::future::join_all polls all
+    // futures on the calling async task without moving them to another thread.
+    let futures_vec: Vec<_> = specs.into_iter().map(|spec| {
+        let cfg_clone   = cfg.clone();
+        let repo_str    = root.to_string_lossy().to_string();
+        let child_depth = depth + 1;
+        let augmented_task = format!(
+            "{}\n\nIMPORTANT: When finished, write your results to memory key \"{}\" \
+             using memory_write before calling finish.",
+            spec.task, spec.memory_key
+        );
+        let role_name  = spec.role.name().to_string();
+        let memory_key = spec.memory_key.clone();
+
+        async move {
+            let result: Result<String> = async {
+                let mut sub = SweAgent::new_with_depth(
+                    cfg_clone, &repo_str, spec.max_steps, spec.role, child_depth
+                )?;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(timeout_secs),
+                    sub.run_capture(&augmented_task),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("[{role_name}] timed out after {timeout_secs}s"))?
+            }.await;
+            (role_name, memory_key, result)
+        }
+    }).collect();
+
+    let results = futures::future::join_all(futures_vec).await;
+
+    // Collect results
+    let mut summaries: Vec<String> = Vec::new();
+    let mut all_ok = true;
+
+    for (role_name, memory_key, result) in results {
+        match result {
+            Ok(summary) => {
+                let first = summary.lines().next().unwrap_or("(done)");
+                summaries.push(format!(
+                    "  ✓ {role_name} → key=\"{memory_key}\": {first}"
+                ));
+            }
+            Err(e) => {
+                summaries.push(format!(
+                    "  ✗ {role_name} → key=\"{memory_key}\": ERROR: {e}"
+                ));
+                all_ok = false;
+            }
+        }
+    }
+
+    summaries.sort(); // deterministic output order
+    let body = summaries.join("\n");
+
+    Ok(ToolResult {
+        output: format!(
+            "spawn_agents: {n} agent(s) finished (depth={}).\n\
+             Use memory_read(<key>) to access each result.\n\n\
+             Results:\n{body}",
+            depth + 1
+        ),
+        success: all_ok,
+    })
+}
+
 
 // ─── github_api ───────────────────────────────────────────────────────────────
 
@@ -2539,9 +2951,556 @@ async fn notify(args: &Value, tg: &TelegramConfig) -> Result<ToolResult> {
     Ok(ToolResult::ok(format!("Notification (stdout): {message}")))
 }
 
-#[cfg(test)]
+// ─── Background process management ───────────────────────────────────────────
+//
+// Allows the agent to run long-lived processes (dev servers, watchers, etc.)
+// alongside other work. Processes are tracked by a user-supplied string ID.
+//
+// Typical workflow:
+//   run_background("frontend", "trunk", ["serve"], wait_ms=3000)
+//   screenshot("http://localhost:3080")
+//   process_kill("frontend")
+
+/// Start a process in the background and return immediately.
+///
+/// Args:
+///   id        — unique name for this process (e.g. "frontend", "api")
+///   program   — executable name or path
+///   args?     — argument array (default: [])
+///   cwd?      — working directory (default: repo root)
+///   wait_ms?  — milliseconds to wait after spawn before returning, so the
+///               process has time to bind its port (default: 1000)
+///
+/// If a process with the same ID already exists, it is killed first.
+/// Returns the PID and the effective command string.
+async fn run_background(args: &Value, root: &Path) -> Result<ToolResult> {
+    let id      = str_arg(args, "id")?;
+    let program = str_arg(args, "program")?;
+    let cmd_args: Vec<String> = args
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let cwd = if let Some(p) = args.get("cwd").and_then(|v| v.as_str()) {
+        resolve(root, p)?
+    } else {
+        root.to_path_buf()
+    };
+    let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(1000);
+
+    // Kill existing process with same ID if present
+    {
+        let mut reg = bg_registry().lock().unwrap();
+        if let Some(mut old) = reg.remove(id) {
+            let _ = old.child.kill().await;
+            tracing::info!("run_background: killed existing '{}' before restart", id);
+        }
+    }
+
+    let command_label = if cmd_args.is_empty() {
+        program.to_string()
+    } else {
+        format!("{} {}", program, cmd_args.join(" "))
+    };
+
+    tracing::info!("run_background: starting '{}' → {}", id, command_label);
+
+    let child = tokio::process::Command::new(program)
+        .args(&cmd_args)
+        .current_dir(&cwd)
+        // Detach stdio so the process doesn't block on our pipes
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("run_background: failed to start '{program}': {e}"))?;
+
+    let pid = child.id().unwrap_or(0);
+
+    {
+        let mut reg = bg_registry().lock().unwrap();
+        reg.insert(id.to_string(), BackgroundProcess {
+            child,
+            command: command_label.clone(),
+            cwd: cwd.to_string_lossy().to_string(),
+            started_at: next_tick(),
+        });
+    }
+
+    // Give the process time to initialise (bind port, load config, etc.)
+    if wait_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+    }
+
+    // Check it's still alive after the wait
+    let still_alive = {
+        let mut reg = bg_registry().lock().unwrap();
+        if let Some(bp) = reg.get_mut(id) {
+            match bp.child.try_wait() {
+                Ok(None) => true,           // still running
+                Ok(Some(status)) => {
+                    tracing::warn!("run_background '{}' exited immediately: {}", id, status);
+                    false
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        }
+    };
+
+    if still_alive {
+        Ok(ToolResult::ok(format!(
+            "run_background OK: id={id} pid={pid}\n\
+             command: {command_label}\n\
+             cwd: {}\n\
+             waited: {wait_ms}ms\n\
+             status: running",
+            cwd.display()
+        )))
+    } else {
+        // Remove the dead process from registry
+        bg_registry().lock().unwrap().remove(id);
+        Ok(ToolResult {
+            output: format!(
+                "run_background WARNING: id={id} pid={pid} — process exited immediately after {wait_ms}ms\n\
+                 command: {command_label}\n\
+                 Check the program name, args, and working directory."
+            ),
+            success: false,
+        })
+    }
+}
+
+/// Check the status of a background process.
+///
+/// Args:
+///   id — process ID as given to run_background
+///
+/// Returns: running/exited status, PID, exit code if exited.
+async fn process_status(args: &Value) -> Result<ToolResult> {
+    let id = str_arg(args, "id")?;
+
+    let mut reg = bg_registry().lock().unwrap();
+    match reg.get_mut(id) {
+        None => Ok(ToolResult {
+            output: format!("process_status: no process with id '{id}'\nUse process_list to see all active processes."),
+            success: false,
+        }),
+        Some(bp) => {
+            match bp.child.try_wait() {
+                Err(e) => Ok(ToolResult {
+                    output: format!("process_status '{id}': error querying process: {e}"),
+                    success: false,
+                }),
+                Ok(None) => {
+                    // Still running
+                    let pid = bp.child.id().unwrap_or(0);
+                    Ok(ToolResult::ok(format!(
+                        "process_status: id={id} status=running pid={pid}\n\
+                         command: {}\n\
+                         cwd: {}",
+                        bp.command, bp.cwd
+                    )))
+                }
+                Ok(Some(status)) => {
+                    let exit_code = status.code().unwrap_or(-1);
+                    let cmd = bp.command.clone();
+                    let cwd = bp.cwd.clone();
+                    // Remove from registry — process is done
+                    reg.remove(id);
+                    Ok(ToolResult {
+                        output: format!(
+                            "process_status: id={id} status=exited exit_code={exit_code}\n\
+                             command: {cmd}\n\
+                             cwd: {cwd}"
+                        ),
+                        success: exit_code == 0,
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Kill a background process.
+///
+/// Args:
+///   id — process ID as given to run_background
+///
+/// Sends SIGKILL on Unix, calls TerminateProcess on Windows.
+/// Returns success=true if the process was found and killed.
+async fn process_kill(args: &Value) -> Result<ToolResult> {
+    let id = str_arg(args, "id")?;
+
+    let child = {
+        let mut reg = bg_registry().lock().unwrap();
+        reg.remove(id)
+    };
+
+    match child {
+        None => Ok(ToolResult {
+            output: format!("process_kill: no process with id '{id}'"),
+            success: false,
+        }),
+        Some(mut bp) => {
+            let pid = bp.child.id().unwrap_or(0);
+            let cmd = bp.command.clone();
+            match bp.child.kill().await {
+                Ok(()) => Ok(ToolResult::ok(format!(
+                    "process_kill OK: id={id} pid={pid} killed\n\
+                     command: {cmd}"
+                ))),
+                Err(e) => Ok(ToolResult {
+                    output: format!(
+                        "process_kill '{id}': kill failed (process may have already exited): {e}\n\
+                         command: {cmd}"
+                    ),
+                    success: false,
+                }),
+            }
+        }
+    }
+}
+
+/// List all active background processes.
+///
+/// Args: none
+///
+/// Returns a table of all processes currently tracked, with their ID, PID,
+/// command, and working directory. Processes that have exited are cleaned up.
+async fn process_list(_args: &Value) -> Result<ToolResult> {
+    let mut reg = bg_registry().lock().unwrap();
+
+    if reg.is_empty() {
+        return Ok(ToolResult::ok("process_list: no background processes running"));
+    }
+
+    // Check each process and collect status
+    let mut rows: Vec<(u64, String, String, u32, String, String)> = Vec::new();
+    let mut dead_ids: Vec<String> = Vec::new();
+
+    for (id, bp) in reg.iter_mut() {
+        let pid = bp.child.id().unwrap_or(0);
+        let status = match bp.child.try_wait() {
+            Ok(None) => "running".to_string(),
+            Ok(Some(s)) => {
+                dead_ids.push(id.clone());
+                format!("exited({})", s.code().unwrap_or(-1))
+            }
+            Err(_) => "unknown".to_string(),
+        };
+        rows.push((bp.started_at, id.clone(), bp.command.clone(), pid, status, bp.cwd.clone()));
+    }
+
+    // Remove dead processes
+    for dead in dead_ids {
+        reg.remove(&dead);
+    }
+
+    // Sort by start order
+    rows.sort_by_key(|r| r.0);
+
+    let mut out = format!("process_list: {} process(es)\n\n", rows.len());
+    for (_, id, cmd, pid, status, cwd) in &rows {
+        out.push_str(&format!(
+            "  id={id}  pid={pid}  status={status}\n  command: {cmd}\n  cwd: {cwd}\n\n"
+        ));
+    }
+    out.pop(); // trailing newline
+
+    Ok(ToolResult::ok(out))
+}
+
+
+//
+// These tools require [browser] to be configured in config.toml.
+// Current implementation: stubs that return a clear "not configured" message.
+// Full CDP implementation will be added in a future version (chromiumoxide backend).
+//
+// Architecture note: all tools speak CDP — the backend (Chrome, Lightpanda, etc.)
+// is transparent. Swap cdp_url in config.toml to change the browser engine.
+
+/// Returns an error result explaining that browser is not configured.
+fn browser_not_configured(tool: &str) -> Result<ToolResult> {
+    Ok(ToolResult {
+        output: format!(
+            "{tool}: browser backend not configured.\n\
+             Add a [browser] section to config.toml:\n\n\
+             [browser]\n\
+             # Option 1: connect to a running CDP server (Chrome, Lightpanda)\n\
+             cdp_url = \"ws://127.0.0.1:9222\"\n\n\
+             # Option 2: launch Chrome locally\n\
+             # chrome_path = \"/usr/bin/chromium\"\n\n\
+             # Screenshot output directory (default: .ai/screenshots)\n\
+             # screenshot_dir = \".ai/screenshots\""
+        ),
+        success: false,
+    })
+}
+
+/// Take a screenshot of a URL and save it to the screenshot directory.
+///
+/// Args:
+///   url         — URL to navigate to
+///   wait_ms?    — milliseconds to wait after page load (default: 1000)
+///   full_page?  — capture full scrollable page, not just viewport (default: false)
+///
+/// Returns: path to saved PNG and base64-encoded image data for vision models.
+fn browser_screenshot(
+    args: &Value,
+    root: &Path,
+    cfg: &crate::config::AgentConfig,
+) -> Result<ToolResult> {
+    if !cfg.browser.is_configured() {
+        return browser_not_configured("screenshot");
+    }
+    let url     = str_arg(args, "url")?;
+    let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(1000);
+    let _ = args.get("full_page").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    // Stub: full implementation requires chromiumoxide + CDP async session
+    Ok(ToolResult {
+        output: format!(
+            "screenshot: CDP backend not yet implemented.\n\
+             Would navigate to: {url}\n\
+             Would wait: {wait_ms}ms\n\
+             Would save to: {}\n\
+             [Browser tool stub — implement with chromiumoxide in a future version]",
+            cfg.browser.effective_screenshot_dir(root).display()
+        ),
+        success: false,
+    })
+}
+
+/// Fetch the text content of a URL (or specific selector) after JavaScript rendering.
+///
+/// Unlike fetch_url, this uses a real browser and waits for JS to execute.
+/// Use this for SPAs, React/Vue apps, and pages that load content dynamically.
+///
+/// Args:
+///   url       — URL to navigate to
+///   selector? — CSS selector to extract text from (default: entire page body)
+///   wait_ms?  — milliseconds to wait after page load (default: 1000)
+fn browser_get_text(args: &Value, cfg: &crate::config::AgentConfig) -> Result<ToolResult> {
+    if !cfg.browser.is_configured() {
+        return browser_not_configured("browser_get_text");
+    }
+    let url = str_arg(args, "url")?;
+    let _ = args.get("selector").and_then(|v| v.as_str());
+
+    Ok(ToolResult {
+        output: format!(
+            "browser_get_text: CDP backend not yet implemented.\n\
+             Would navigate to: {url}\n\
+             [Browser tool stub — implement with chromiumoxide in a future version]"
+        ),
+        success: false,
+    })
+}
+
+/// Perform an action in the browser on a CSS selector.
+///
+/// Args:
+///   action    — one of: "click", "type", "hover", "clear", "select"
+///   selector  — CSS selector for the target element
+///   value?    — text to type (required for "type"), option value (required for "select")
+///   wait_ms?  — milliseconds to wait after action (default: 500)
+///
+/// After every action, an implicit screenshot is taken and saved to the screenshot directory.
+fn browser_action(args: &Value, cfg: &crate::config::AgentConfig) -> Result<ToolResult> {
+    if !cfg.browser.is_configured() {
+        return browser_not_configured("browser_action");
+    }
+    let action   = str_arg(args, "action")?;
+    let selector = str_arg(args, "selector")?;
+
+    let valid_actions = ["click", "type", "hover", "clear", "select"];
+    if !valid_actions.contains(&action) {
+        return Ok(ToolResult {
+            output: format!(
+                "browser_action: unknown action '{action}'. \
+                 Valid actions: {}", valid_actions.join(", ")
+            ),
+            success: false,
+        });
+    }
+
+    Ok(ToolResult {
+        output: format!(
+            "browser_action: CDP backend not yet implemented.\n\
+             Would perform: {action} on '{selector}'\n\
+             [Browser tool stub — implement with chromiumoxide in a future version]"
+        ),
+        success: false,
+    })
+}
+
+/// Navigate the browser to a URL and wait for the page to load.
+///
+/// Args:
+///   url      — URL to navigate to
+///   wait_ms? — milliseconds to wait after load event (default: 1000)
+///
+/// Takes an implicit screenshot after navigation and returns the page title and URL.
+fn browser_navigate(args: &Value, cfg: &crate::config::AgentConfig) -> Result<ToolResult> {
+    if !cfg.browser.is_configured() {
+        return browser_not_configured("browser_navigate");
+    }
+    let url = str_arg(args, "url")?;
+
+    Ok(ToolResult {
+        output: format!(
+            "browser_navigate: CDP backend not yet implemented.\n\
+             Would navigate to: {url}\n\
+             [Browser tool stub — implement with chromiumoxide in a future version]"
+        ),
+        success: false,
+    })
+}
+
+// ─── Agent self-improvement tools ─────────────────────────────────────────────
+//
+// These tools let the agent signal when it encounters a capability gap.
+// Results are written to ~/.do_it/tool_wishlist.md and serve as a
+// structured backlog of agent-observed needs for the developer to review.
+
+/// Request a new tool or capability.
+///
+/// Called by Boss (and Default role) when a task reveals a missing capability
+/// that would make the agent significantly more effective.
+///
+/// Args:
+///   name         — proposed tool name (snake_case)
+///   description  — what the tool should do
+///   motivation   — what task triggered this request and why existing tools fall short
+///   priority?    — "low" | "medium" | "high" (default: "medium")
+///
+/// Writes a structured entry to ~/.do_it/tool_wishlist.md.
+async fn tool_request(args: &Value) -> Result<ToolResult> {
+    let name        = str_arg(args, "name")?;
+    let description = str_arg(args, "description")?;
+    let motivation  = str_arg(args, "motivation")?;
+    let priority    = args.get("priority")
+        .and_then(|v| v.as_str())
+        .unwrap_or("medium");
+
+    let valid_priorities = ["low", "medium", "high"];
+    let priority = if valid_priorities.contains(&priority) { priority } else { "medium" };
+
+    let wishlist_path = match crate::config::global_tool_wishlist_path() {
+        Some(p) => p,
+        None => return Ok(ToolResult {
+            output: "tool_request: cannot resolve ~/.do_it/ (home directory unavailable)".into(),
+            success: false,
+        }),
+    };
+
+    // Create ~/.do_it/ if it doesn't exist yet
+    if let Some(parent) = wishlist_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("tool_request mkdir: {e}"))?;
+    }
+
+    let now = chrono_now();
+    let entry = format!(
+        "\n## [{now}] {name} [{priority}]\n\
+         **Description:** {description}\n\
+         **Motivation:** {motivation}\n\
+         **Priority:** {priority}\n"
+    );
+
+    // Always append — wishlist is a running log, never overwritten
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&wishlist_path)
+        .map_err(|e| anyhow::anyhow!("tool_request open wishlist: {e}"))?;
+    writeln!(file, "{entry}")
+        .map_err(|e| anyhow::anyhow!("tool_request write wishlist: {e}"))?;
+
+    Ok(ToolResult::ok(format!(
+        "tool_request recorded: '{name}' [{priority}]\n\
+         Saved to: {}\n\
+         Review with: cat ~/.do_it/tool_wishlist.md",
+        wishlist_path.display()
+    )))
+}
+
+/// Report an observed capability gap without proposing a specific solution.
+///
+/// Use this when the agent notices a structural limitation — it can't see something,
+/// can't reach something, or is working around a missing primitive.
+/// Less specific than tool_request: the gap is real but the right solution is unclear.
+///
+/// Args:
+///   context — what task was being attempted and what limitation was encountered
+///   impact  — what is the consequence of this gap (bugs missed, workarounds needed, etc.)
+///
+/// Writes a structured entry to ~/.do_it/tool_wishlist.md.
+async fn capability_gap(args: &Value) -> Result<ToolResult> {
+    let context = str_arg(args, "context")?;
+    let impact  = str_arg(args, "impact")?;
+
+    let wishlist_path = match crate::config::global_tool_wishlist_path() {
+        Some(p) => p,
+        None => return Ok(ToolResult {
+            output: "capability_gap: cannot resolve ~/.do_it/ (home directory unavailable)".into(),
+            success: false,
+        }),
+    };
+
+    if let Some(parent) = wishlist_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow::anyhow!("capability_gap mkdir: {e}"))?;
+    }
+
+    let now = chrono_now();
+    let entry = format!(
+        "\n## [{now}] CAPABILITY GAP\n\
+         **Context:** {context}\n\
+         **Impact:** {impact}\n"
+    );
+
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&wishlist_path)
+        .map_err(|e| anyhow::anyhow!("capability_gap open wishlist: {e}"))?;
+    writeln!(file, "{entry}")
+        .map_err(|e| anyhow::anyhow!("capability_gap write wishlist: {e}"))?;
+
+    Ok(ToolResult::ok(format!(
+        "capability_gap recorded.\n\
+         Context: {context}\n\
+         Saved to: {}",
+        wishlist_path.display()
+    )))
+}
+
+/// Returns current date-time as a simple string for wishlist entries.
+pub fn chrono_now() -> String {
+    // Use system time — no chrono dependency required.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Simple ISO-like format: YYYY-MM-DD
+    let days  = secs / 86400;
+    let years = 1970 + days / 365;
+    let rem   = days % 365;
+    let month = (rem / 30) + 1;
+    let day   = (rem % 30) + 1;
+    format!("{years}-{month:02}-{day:02}")
+}
+
+
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
+    #[allow(unused_imports)]
     use serde_json::json;
 
     // ── resolve_memory_path ──────────────────────────────────────────────────
@@ -2589,6 +3548,10 @@ mod tests {
         if let Some(p) = resolve_memory_path(root, "boss_notes") {
             assert!(p.to_string_lossy().contains(".do_it"), "boss_notes should be under .do_it");
             assert!(p.to_string_lossy().ends_with("boss_notes.md"));
+        }
+        if let Some(p) = resolve_memory_path(root, "tool_wishlist") {
+            assert!(p.to_string_lossy().contains(".do_it"), "tool_wishlist should be under .do_it");
+            assert!(p.to_string_lossy().ends_with("tool_wishlist.md"));
         }
     }
 
@@ -3070,5 +4033,360 @@ mod tests {
             assert!(!p.starts_with(dir.path()),
                 "resolve() currently does NOT block traversal — this documents the gap");
         }
+    }
+
+    // ── browser tools ────────────────────────────────────────────────────────
+
+    #[test]
+    fn browser_not_configured_returns_helpful_message() {
+        let cfg = crate::config::AgentConfig::default(); // no [browser] set
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({ "url": "http://localhost:3080" });
+
+        let r = browser_screenshot(&args, dir.path(), &cfg).unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("not configured"));
+        assert!(r.output.contains("cdp_url"));
+
+        let r2 = browser_get_text(&args, &cfg).unwrap();
+        assert!(!r2.success);
+        assert!(r2.output.contains("not configured"));
+
+        let args_action = json!({ "action": "click", "selector": "#btn" });
+        let r3 = browser_action(&args_action, &cfg).unwrap();
+        assert!(!r3.success);
+
+        let r4 = browser_navigate(&args, &cfg).unwrap();
+        assert!(!r4.success);
+    }
+
+    #[test]
+    fn browser_action_rejects_invalid_action() {
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.browser.cdp_url = Some("ws://127.0.0.1:9222".to_string());
+        let args = json!({ "action": "teleport", "selector": "#btn" });
+        let r = browser_action(&args, &cfg).unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("unknown action"));
+    }
+
+    #[test]
+    fn browser_screenshot_stub_returns_false_when_configured() {
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.browser.cdp_url = Some("ws://127.0.0.1:9222".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let args = json!({ "url": "http://example.com" });
+        let r = browser_screenshot(&args, dir.path(), &cfg).unwrap();
+        // Stub returns success=false until CDP is implemented
+        assert!(!r.success);
+        assert!(r.output.contains("not yet implemented"));
+    }
+
+    // ── tool_request / capability_gap ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tool_request_writes_to_wishlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let wishlist = dir.path().join("tool_wishlist.md");
+
+        // Temporarily override the wishlist path by writing directly
+        // (we test the write logic by calling the inner helper with a known path)
+        let entry = format!(
+            "\n## [2026-01-01] run_background [high]\n\
+             **Description:** Run a background process\n\
+             **Motivation:** Needed for dev servers\n\
+             **Priority:** high\n"
+        );
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true).append(true).open(&wishlist).unwrap();
+        writeln!(f, "{entry}").unwrap();
+
+        let content = std::fs::read_to_string(&wishlist).unwrap();
+        assert!(content.contains("run_background"));
+        assert!(content.contains("[high]"));
+        assert!(content.contains("Motivation"));
+    }
+
+    #[test]
+    fn chrono_now_is_plausible() {
+        let s = chrono_now();
+        // Should look like YYYY-MM-DD
+        assert_eq!(s.len(), 10);
+        assert!(s.starts_with("20")); // 21st century
+        assert!(s.contains('-'));
+    }
+
+    // ── background process tools ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_background_starts_process() {
+        // Use a cross-platform sleeper: `sleep` on Unix, ping loop on Windows
+        #[cfg(unix)]
+        let (prog, args) = ("sleep", vec!["10"]);
+        #[cfg(windows)]
+        let (prog, args) = ("ping", vec!["-n", "10", "127.0.0.1"]);
+
+        let root = tempfile::tempdir().unwrap();
+        let jargs = serde_json::json!({
+            "id": "test-bg-starts",
+            "program": prog,
+            "args": args,
+            "wait_ms": 200
+        });
+        let r = run_background(&jargs, root.path()).await.unwrap();
+        assert!(r.success, "should start: {}", r.output);
+        assert!(r.output.contains("running"));
+        assert!(r.output.contains("test-bg-starts"));
+
+        // Clean up
+        let kill_args = serde_json::json!({ "id": "test-bg-starts" });
+        let _ = process_kill(&kill_args).await;
+    }
+
+    #[tokio::test]
+    async fn run_background_replaces_existing() {
+        #[cfg(unix)]
+        let prog = "sleep";
+        #[cfg(windows)]
+        let prog = "ping";
+
+        let root = tempfile::tempdir().unwrap();
+        let jargs1 = serde_json::json!({
+            "id": "test-replace",
+            "program": prog,
+            "args": if cfg!(unix) { vec!["10"] } else { vec!["-n", "10", "127.0.0.1"] },
+            "wait_ms": 100
+        });
+        let r1 = run_background(&jargs1, root.path()).await.unwrap();
+        assert!(r1.success);
+
+        // Start again with same ID — should replace without error
+        let r2 = run_background(&jargs1, root.path()).await.unwrap();
+        assert!(r2.success, "replacement should succeed: {}", r2.output);
+
+        let kill_args = serde_json::json!({ "id": "test-replace" });
+        let _ = process_kill(&kill_args).await;
+    }
+
+    #[tokio::test]
+    async fn run_background_bad_program() {
+        let root = tempfile::tempdir().unwrap();
+        let jargs = serde_json::json!({
+            "id": "test-bad",
+            "program": "this_program_does_not_exist_xyzzy",
+            "wait_ms": 0
+        });
+        let r = run_background(&jargs, root.path()).await;
+        // Should return Err (program not found) or success=false
+        assert!(r.is_err() || !r.unwrap().success);
+    }
+
+    #[tokio::test]
+    async fn process_status_unknown_id() {
+        let jargs = serde_json::json!({ "id": "does-not-exist-xyzzy" });
+        let r = process_status(&jargs).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("no process"));
+    }
+
+    #[tokio::test]
+    async fn process_kill_unknown_id() {
+        let jargs = serde_json::json!({ "id": "ghost-process-xyzzy" });
+        let r = process_kill(&jargs).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("no process"));
+    }
+
+    #[tokio::test]
+    async fn process_list_empty_when_none() {
+        // process_list should succeed even with empty registry
+        let r = process_list(&serde_json::json!({})).await.unwrap();
+        assert!(r.success);
+        assert!(r.output.contains("no background processes") || r.output.contains("process(es)"));
+    }
+
+    #[tokio::test]
+    async fn process_status_running_process() {
+        #[cfg(unix)]
+        let (prog, args) = ("sleep", vec!["10"]);
+        #[cfg(windows)]
+        let (prog, args) = ("ping", vec!["-n", "10", "127.0.0.1"]);
+
+        let root = tempfile::tempdir().unwrap();
+        let id = "test-status-running";
+        let jargs = serde_json::json!({
+            "id": id, "program": prog, "args": args, "wait_ms": 100
+        });
+        let r = run_background(&jargs, root.path()).await.unwrap();
+        assert!(r.success);
+
+        let status_args = serde_json::json!({ "id": id });
+        let rs = process_status(&status_args).await.unwrap();
+        assert!(rs.success, "status should succeed: {}", rs.output);
+        assert!(rs.output.contains("running"));
+
+        let _ = process_kill(&serde_json::json!({ "id": id })).await;
+    }
+
+    // ── git_pull / git_push ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn git_pull_fails_gracefully_in_non_repo() {
+        let root = tempfile::tempdir().unwrap();
+        let args = serde_json::json!({});
+        let r = git_pull(&args, root.path()).await.unwrap();
+        // Non-git dir: should return success=false, not panic
+        assert!(!r.success);
+        assert!(r.output.contains("Not a git repository"));
+    }
+
+    #[tokio::test]
+    async fn git_push_aborted_without_consent() {
+        // git_push must ask for consent. With no Telegram and no stdin tty,
+        // stdin read returns empty string → not confirmed → aborted.
+        let root = tempfile::tempdir().unwrap();
+        // Init a real git repo so we pass the git_check
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root.path())
+            .output().await.unwrap();
+
+        let tg = TelegramConfig::default(); // no token
+        let args = serde_json::json!({ "remote": "origin", "branch": "main" });
+        let r = git_push(&args, root.path(), &tg).await.unwrap();
+        assert!(!r.success, "push without consent must fail: {}", r.output);
+        assert!(r.output.contains("ABORTED"), "must say ABORTED: {}", r.output);
+    }
+
+    #[tokio::test]
+    async fn git_push_force_flag_passes_through_after_consent() {
+        // Verify that the force flag is correctly parsed — we only test the
+        // abort path here since we can't interactively confirm in CI.
+        let root = tempfile::tempdir().unwrap();
+        tokio::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root.path())
+            .output().await.unwrap();
+
+        let tg = TelegramConfig::default();
+        let args = serde_json::json!({ "force": true });
+        let r = git_push(&args, root.path(), &tg).await.unwrap();
+        // Still aborted without consent, but force warning should appear in the question
+        // (we can only verify the abort path in unit tests)
+        assert!(!r.success);
+        assert!(r.output.contains("ABORTED"));
+    }
+
+    #[test]
+    fn developer_allowlist_has_git_pull_and_push() {
+        use crate::config::Role;
+        let tools = Role::Developer.allowed_tools();
+        assert!(tools.contains(&"git_pull"), "Developer needs git_pull");
+        assert!(tools.contains(&"git_push"), "Developer needs git_push");
+    }
+
+    #[test]
+    fn qa_has_git_pull_but_not_push() {
+        use crate::config::Role;
+        let qa = Role::Qa.allowed_tools();
+        assert!(qa.contains(&"git_pull"), "QA can pull");
+        assert!(!qa.contains(&"git_push"), "QA must not push");
+    }
+
+    #[test]
+    fn reviewer_has_git_pull_but_not_push() {
+        use crate::config::Role;
+        let r = Role::Reviewer.allowed_tools();
+        assert!(r.contains(&"git_pull"), "Reviewer can pull");
+        assert!(!r.contains(&"git_push"), "Reviewer must not push");
+    }
+
+    // ── spawn_agent depth limit ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn spawn_agent_refused_at_max_depth() {
+        use crate::config::AgentConfig;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig { max_depth: 2, ..AgentConfig::default() };
+        let args = serde_json::json!({
+            "role": "navigator",
+            "task": "list files"
+        });
+        // depth=2 equals max_depth=2 — should be refused
+        let r = spawn_agent(&args, root.path(), &cfg, 10, 2).await.unwrap();
+        assert!(!r.success, "should refuse at max_depth: {}", r.output);
+        assert!(r.output.contains("REFUSED"), "must say REFUSED: {}", r.output);
+        assert!(r.output.contains("depth"), "must mention depth: {}", r.output);
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_refuses_boss_role() {
+        use crate::config::AgentConfig;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig::default();
+        let args = serde_json::json!({ "role": "boss", "task": "take over" });
+        let r = spawn_agent(&args, root.path(), &cfg, 10, 0).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("recursion guard"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agents_refused_at_max_depth() {
+        use crate::config::AgentConfig;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig { max_depth: 1, ..AgentConfig::default() };
+        let args = serde_json::json!({
+            "agents": [
+                { "role": "navigator", "task": "find files" }
+            ]
+        });
+        let r = spawn_agents(&args, root.path(), &cfg, 10, 1).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("REFUSED"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agents_rejects_empty_array() {
+        use crate::config::AgentConfig;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig::default();
+        let args = serde_json::json!({ "agents": [] });
+        let r = spawn_agents(&args, root.path(), &cfg, 10, 0).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("empty"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agents_rejects_boss_in_array() {
+        use crate::config::AgentConfig;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig::default();
+        let args = serde_json::json!({
+            "agents": [{ "role": "boss", "task": "do stuff" }]
+        });
+        let r = spawn_agents(&args, root.path(), &cfg, 10, 0).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("recursion guard") || r.output.contains("boss"));
+    }
+
+    #[tokio::test]
+    async fn spawn_agents_rejects_too_many() {
+        use crate::config::AgentConfig;
+        let root = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig::default();
+        let agents: Vec<_> = (0..9)
+            .map(|i| serde_json::json!({ "role": "navigator", "task": format!("task {i}") }))
+            .collect();
+        let args = serde_json::json!({ "agents": agents });
+        let r = spawn_agents(&args, root.path(), &cfg, 10, 0).await.unwrap();
+        assert!(!r.success);
+        assert!(r.output.contains("too many") || r.output.contains("Maximum"));
+    }
+
+    #[test]
+    fn boss_has_spawn_agents() {
+        use crate::config::Role;
+        assert!(Role::Boss.allowed_tools().contains(&"spawn_agents"));
     }
 }

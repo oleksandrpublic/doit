@@ -17,14 +17,16 @@ Runs on Windows and Linux with no shell dependency, no Python, no cloud APIs.
 5. [Agent Roles](#agent-roles)
 6. [Tools](#tools)
 7. [Telegram — ask_human and notify](#telegram--ask_human-and-notify)
-8. [How the Agent Works](#how-the-agent-works)
-9. [Model Selection and Routing](#model-selection-and-routing)
-10. [Sub-agent Architecture](#sub-agent-architecture)
-11. [Persistent Memory](#persistent-memory)
-12. [Limitations](#limitations)
-13. [Tips and Recommendations](#tips-and-recommendations)
-14. [Troubleshooting](#troubleshooting)
-15. [Project Structure](#project-structure)
+8. [Browser Tools](#browser-tools)
+9. [Agent Self-Improvement](#agent-self-improvement)
+10. [How the Agent Works](#how-the-agent-works)
+11. [Model Selection and Routing](#model-selection-and-routing)
+12. [Sub-agent Architecture](#sub-agent-architecture)
+13. [Persistent Memory](#persistent-memory)
+14. [Limitations](#limitations)
+15. [Tips and Recommendations](#tips-and-recommendations)
+16. [Troubleshooting](#troubleshooting)
+17. [Project Structure](#project-structure)
 
 ---
 
@@ -384,6 +386,28 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 |---|---|---|
 | `spawn_agent` | `role`, `task`, `memory_key?`, `max_steps?` | Delegate a subtask to a specialised sub-agent |
 
+### Browser
+
+Requires `[browser]` to be configured in `config.toml`. The agent speaks CDP — the backend is transparent (Chrome, Lightpanda, or any CDP-compatible server).
+
+| Tool | Arguments | Description |
+|---|---|---|
+| `screenshot` | `url`, `wait_ms?`, `full_page?` | Navigate to URL, take PNG screenshot; returns file path + base64 for vision model |
+| `browser_get_text` | `url`, `selector?`, `wait_ms?` | Fetch page text after JavaScript renders; use instead of `fetch_url` for SPAs |
+| `browser_action` | `action`, `selector`, `value?`, `wait_ms?` | Interact with an element: `click`, `type`, `hover`, `clear`, `select` |
+| `browser_navigate` | `url`, `wait_ms?` | Navigate and wait for page load; takes implicit screenshot |
+
+If `[browser]` is not configured, tools return a helpful setup message instead of failing silently.
+
+### Self-improvement
+
+| Tool | Arguments | Description |
+|---|---|---|
+| `tool_request` | `name`, `description`, `motivation`, `priority?` | Request a new tool — appends to `~/.do_it/tool_wishlist.md` |
+| `capability_gap` | `context`, `impact` | Report a structural blind spot without a specific solution — appends to wishlist |
+
+`tool_request` and `capability_gap` are available to `boss` and `default` roles. The Boss calls `tool_request` when it encounters a missing capability for the second time in any session, and `capability_gap` when it observes something it structurally cannot do.
+
 See [Sub-agent Architecture](#sub-agent-architecture) for details.
 
 ---
@@ -427,6 +451,125 @@ Please also update the README after the refactor." >> .ai/state/external_message
 ```
 
 The next run will show: `[inbox] 2 external message(s) received`.
+
+---
+
+## Browser Tools
+
+Browser tools give the agent eyes — the ability to see rendered pages, interact with UI elements, and take screenshots. This is essential for JavaScript-heavy applications (React, Vue, Leptos) where `fetch_url` returns an empty shell.
+
+### Setup
+
+The agent speaks CDP (Chrome DevTools Protocol). The backend is transparent — swap `cdp_url` to change from Chrome to Lightpanda or any future CDP-compatible browser without changing any agent code.
+
+```toml
+# config.toml
+[browser]
+# Option 1: connect to a running CDP server
+cdp_url = "ws://127.0.0.1:9222"
+
+# Option 2: launch Chrome locally (requires chromiumoxide feature — coming in a future version)
+# chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+# Screenshot output directory (default: .ai/screenshots)
+# screenshot_dir = ".ai/screenshots"
+```
+
+Start a CDP server before running the agent:
+
+```bash
+# Chrome (headless)
+google-chrome --headless --remote-debugging-port=9222
+
+# Lightpanda — lightweight, designed for AI, 9x less RAM than Chrome
+# Linux/macOS binary:
+lightpanda serve --host 127.0.0.1 --port 9222
+
+# Docker:
+docker run -d --name lightpanda -p 9222:9222 lightpanda/browser:nightly
+```
+
+### How the agent uses browser tools
+
+```
+screenshot(url)          → PNG saved to .ai/screenshots/
+                           base64 returned for vision model input
+browser_get_text(url)    → full page text after JS execution
+browser_action(...)      → click/type/hover + implicit screenshot
+browser_navigate(url)    → navigate + wait + screenshot
+```
+
+The Boss uses screenshots to verify UI work directly, without delegating:
+
+```
+boss: spawn_agent("developer", "add login form to /login")
+boss: screenshot("http://localhost:3080/login")  ← sees result
+boss: browser_action("type", "#email", "test@example.com")
+boss: browser_action("click", "#submit")
+boss: screenshot("http://localhost:3080/dashboard")  ← sees result after login
+```
+
+The Developer uses browser tools for visual feedback after UI changes:
+```
+developer: write_file("src/components/Login.rs", ...)
+developer: run_command("trunk", ["build"])
+developer: screenshot("http://localhost:3080/login")  ← verify rendering
+```
+
+### Vision model integration
+
+`screenshot` returns the image as base64. Pass it to a vision-capable model for deeper analysis:
+
+```bash
+# Take a screenshot and describe it
+do_it run --task screenshot.png --role developer
+```
+
+If `[browser]` is not configured, all browser tools return a setup message explaining what to add to `config.toml`. They never fail silently.
+
+---
+
+## Agent Self-Improvement
+
+The Boss accumulates knowledge about missing capabilities across sessions. Two tools write to `~/.do_it/tool_wishlist.md`:
+
+### tool_request
+
+Called when the Boss encounters a missing capability for the **second time** in any session. Not for first encounters — the agent tries to work around once, then requests.
+
+```json
+{
+  "tool": "tool_request",
+  "args": {
+    "name": "run_background",
+    "description": "Run a process in the background and keep it alive",
+    "motivation": "Need to start trunk serve and then navigate to localhost, but run_command blocks",
+    "priority": "high"
+  }
+}
+```
+
+### capability_gap
+
+Called when the Boss observes a structural blind spot — it cannot see or reach something important — and has no specific solution to propose.
+
+```json
+{
+  "tool": "capability_gap",
+  "args": {
+    "context": "Developer wrote a Leptos component but I cannot see how it renders without a browser",
+    "impact": "Visual bugs and layout issues go undetected until manual review"
+  }
+}
+```
+
+### Reading the wishlist
+
+```bash
+cat ~/.do_it/tool_wishlist.md
+```
+
+Each entry is timestamped and structured. The wishlist is your primary source for understanding what the agent actually needs — derived from real tasks, not speculation.
 
 ---
 
@@ -786,8 +929,8 @@ ollama list
 
 ```
 do_it/
-├── Cargo.toml           name="do_it", edition="2024", version="0.2.2"
-├── config.toml          runtime configuration (models, Telegram, prompt)
+├── Cargo.toml           name="do_it", edition="2024", version="0.3.0"
+├── config.toml          runtime configuration (models, Telegram, [browser])
 ├── README.md            project overview
 ├── DOCS.md              this file
 ├── LICENSE              MIT
@@ -797,23 +940,35 @@ do_it/
 │   ├── prompts/         custom role prompts
 │   ├── state/           plan, last_session, session_counter, external_messages
 │   ├── logs/            history.md
+│   ├── screenshots/     browser tool output (PNG files)
 │   └── knowledge/       lessons_learned, decisions, qa_report, review_report, sub-agent results
 └── src/
     ├── main.rs          CLI: run | config | roles; --role flag; image detection
     ├── agent.rs         main loop, session_init (user_profile + boss_notes injection), loop detection
-    ├── config.rs        AgentConfig, Role enum + allowlists, ModelRouter, global memory helpers
+    ├── config.rs        AgentConfig, BrowserConfig, Role enum + allowlists, ModelRouter, global helpers
     ├── history.rs       sliding window context manager
     ├── shell.rs         Ollama HTTP client: chat, chat_with_image, check_models
-    ├── tools.rs         all tools: filesystem, git, web, GitHub API, AST, memory, spawn_agent, notify, test_coverage
+    ├── tools.rs         all tools including browser stubs and self-improvement tools
     └── prompts/         built-in role prompts compiled into the binary via include_str!
         ├── default.md
-        ├── boss.md
+        ├── boss.md      orchestrator with browser eyes and wishlist rules
         ├── developer.md
         ├── navigator.md
         ├── qa.md
         ├── reviewer.md
         ├── research.md
         └── memory.md
+```
+
+Global config at `~/.do_it/` (created on first run):
+
+```
+~/.do_it/
+├── config.toml          global defaults (overridden by local config.toml)
+├── system_prompt.md     global default prompt override
+├── user_profile.md      your preferences — Boss reads on every session start
+├── boss_notes.md        cross-project insights accumulated by Boss
+└── tool_wishlist.md     agent-requested capabilities — review to prioritise dev work
 ```
 
 ### Dependencies

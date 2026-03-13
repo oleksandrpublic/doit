@@ -18,20 +18,34 @@ pub struct SweAgent {
     system_prompt: String,
     tg: TelegramConfig,
     role: Role,
+    /// Current nesting depth (0 = top-level, incremented for each spawn_agent call)
+    depth: usize,
+    /// Session number set by session_init(), used in session_finish()
+    session_nr: u64,
     /// Stored so sub-agents can inherit connection settings
     cfg_snapshot: AgentConfig,
 }
 
 impl SweAgent {
     pub fn new(cfg: AgentConfig, repo: &str, max_steps: usize, role: Role) -> Result<Self> {
+        Self::new_with_depth(cfg, repo, max_steps, role, 0)
+    }
+
+    /// Create a sub-agent at a specific nesting depth.
+    /// Called from spawn_agent / spawn_agents in tools.rs.
+    pub fn new_with_depth(
+        cfg: AgentConfig,
+        repo: &str,
+        max_steps: usize,
+        role: Role,
+        depth: usize,
+    ) -> Result<Self> {
         let root = PathBuf::from(repo)
             .canonicalize()
             .map_err(|e| anyhow::anyhow!("Repo path '{}' not accessible: {e}", repo))?;
 
         let llm = OllamaClient::new(&cfg.ollama_base_url, cfg.temperature, cfg.max_tokens);
 
-        // System prompt: role-specific (with .ai/prompts/ override) takes priority
-        // over config.toml, unless config was already overridden by --system-prompt
         let system_prompt = if role != Role::Default {
             role.system_prompt(&root)
         } else {
@@ -52,6 +66,8 @@ impl SweAgent {
                 chat_id: cfg.telegram_chat_id.clone(),
             },
             role,
+            depth,
+            session_nr: 0,
             cfg_snapshot: cfg,
         })
     }
@@ -146,6 +162,7 @@ impl SweAgent {
                     println!("╚══════════════════════════════════════╝");
                     println!("Success: {success}");
                     println!("Summary:\n{summary}");
+                    self.session_finish(&effective_task, &summary, success, step);
                     return Ok(());
                 }
                 Err(e) => {
@@ -163,6 +180,7 @@ impl SweAgent {
         }
 
         println!("\nMax steps ({}) reached.", self.max_steps);
+        self.session_finish(&effective_task, "(max steps reached without finish)", false, self.max_steps);
         Ok(())
     }
 
@@ -183,6 +201,7 @@ impl SweAgent {
                         self.role.name(),
                         summary.lines().next().unwrap_or("(no summary)")
                     );
+                    self.session_finish(task, &summary, success, step);
                     return Ok(summary);
                 }
                 Err(e) => {
@@ -199,12 +218,117 @@ impl SweAgent {
             }
         }
 
-        Ok(format!(
+        let timeout_summary = format!(
             "[sub-agent: {}] reached max_steps ({}) without finishing",
             self.role.name(),
             self.max_steps
-        ))
+        );
+        self.session_finish(task, &timeout_summary, false, self.max_steps);
+        Ok(timeout_summary)
         })
+    }
+
+
+    /// Write .ai/logs/session-NNN.md with a structured report of this session.
+    /// Called at the end of run() and run_capture() — only for depth=0 agents.
+    /// Sub-agents (depth > 0) do not write their own session logs.
+    fn session_finish(&self, task: &str, final_summary: &str, success: bool, steps_used: usize) {
+        // Only top-level agents write session logs
+        if self.depth > 0 { return; }
+
+        let logs_dir = self.root.join(".ai/logs");
+        if std::fs::create_dir_all(&logs_dir).is_err() { return; }
+
+        let log_path = logs_dir.join(format!("session-{:03}.md", self.session_nr));
+
+        let now = crate::tools::chrono_now();
+        let role = self.role.name();
+        let n = self.session_nr;
+
+        // Build tool call table from history
+        let turns: Vec<&Turn> = self.history.turns.iter().filter(|t| t.step > 0).collect();
+        let total_calls = turns.len();
+        let ok_calls   = turns.iter().filter(|t| t.success).count();
+        let err_calls  = total_calls - ok_calls;
+
+        // Tool frequency map
+        let mut tool_counts: std::collections::HashMap<&str, (usize, usize)> = Default::default();
+        for t in &turns {
+            let e = tool_counts.entry(t.tool.as_str()).or_insert((0, 0));
+            e.0 += 1;
+            if !t.success { e.1 += 1; }
+        }
+        let mut tool_list: Vec<_> = tool_counts.iter().collect();
+        tool_list.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        let tools_section: String = tool_list.iter()
+            .map(|(name, (calls, errs))| {
+                if *errs > 0 {
+                    format!("  - {name}: {calls} calls ({errs} errors)")
+                } else {
+                    format!("  - {name}: {calls} calls")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let status = if success { "✓ success" } else { "✗ failed / incomplete" };
+
+        let report = format!(
+            "# Session #{n} — {date}\n\n\
+             **Role:** {role}  \n\
+             **Status:** {status}  \n\
+             **Steps used:** {steps_used}  \n\
+             **Tool calls:** {total_calls} ({ok_calls} ok, {err_calls} errors)  \n\n\
+             ## Task\n\n\
+             {task}\n\n\
+             ## Summary\n\n\
+             {final_summary}\n\n\
+             ## Tools used\n\n\
+             {tools_section}\n",
+            date = now,
+        );
+
+        let _ = std::fs::write(&log_path, &report);
+        println!("  [session] Report written to {}", log_path.display());
+
+        // After writing the log, update last_session.md and compress if needed
+        self.update_last_session(final_summary, task, n, success);
+    }
+
+    /// Append this session's summary to last_session.md, then compress if > 200 lines.
+    fn update_last_session(&self, summary: &str, task: &str, n: u64, success: bool) {
+        let state_dir  = self.root.join(".ai/state");
+        let path       = state_dir.join("last_session.md");
+        let now        = crate::tools::chrono_now();
+        let status_str = if success { "✓" } else { "✗" };
+
+        let entry = format!(
+            "\n## Session #{n} — {now} {status_str}\n\
+             **Task:** {task}\n\n\
+             {summary}\n\
+             ---\n"
+        );
+
+        // Append to existing file (or create)
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let updated  = format!("{existing}{entry}");
+
+        let _ = std::fs::write(&path, &updated);
+
+        // Compress if over threshold
+        const MAX_LINES: usize = 200;
+        const KEEP_LINES: usize = 150;
+        let line_count = updated.lines().count();
+        if line_count > MAX_LINES {
+            println!("  [memory] last_session.md has {line_count} lines — compressing to {KEEP_LINES}");
+            let kept: Vec<&str> = updated.lines().rev().take(KEEP_LINES).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            let compressed = format!(
+                "<!-- compressed: older entries removed, keeping last {KEEP_LINES} lines -->\n{}\n",
+                kept.join("\n")
+            );
+            let _ = std::fs::write(&path, compressed);
+        }
     }
 
     fn step<'a>(&'a mut self, task: &'a str, step: usize) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StepOutcome>> + 'a>> {
@@ -263,6 +387,7 @@ impl SweAgent {
             &self.tg,
             &self.cfg_snapshot,
             self.max_steps / 2,
+            self.depth,
         )
         .await?;
 
@@ -297,6 +422,7 @@ impl SweAgent {
                 &self.tg,
                 &self.cfg_snapshot,
                 self.max_steps / 2,
+                self.depth,
             ).await;
         }
 
@@ -366,6 +492,7 @@ impl SweAgent {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0) + 1;
         let _ = std::fs::write(&counter_path, n.to_string());
+        self.session_nr = n;
         println!("Session #{n}");
 
         // Inject last_session into history if it exists
@@ -747,5 +874,74 @@ mod tests {
     fn detect_project_name_none_if_no_file() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(detect_project_name(dir.path()), None);
+    }
+
+    // ── session_finish ────────────────────────────────────────────────────────
+
+    fn make_agent_at(root: &std::path::Path) -> SweAgent {
+        use crate::config::{AgentConfig, Role};
+        let mut a = SweAgent::new_with_depth(
+            AgentConfig::default(), &root.to_string_lossy(), 10, Role::Default, 0
+        ).unwrap();
+        a.session_nr = 42;
+        a
+    }
+
+    #[test]
+    fn session_finish_writes_log_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = make_agent_at(dir.path());
+        agent.session_finish("do something", "all done", true, 3);
+
+        let log = dir.path().join(".ai/logs/session-042.md");
+        assert!(log.exists(), "session log must be created");
+        let content = std::fs::read_to_string(&log).unwrap();
+        assert!(content.contains("Session #42"));
+        assert!(content.contains("do something"));
+        assert!(content.contains("all done"));
+        assert!(content.contains("✓ success"));
+    }
+
+    #[test]
+    fn session_finish_updates_last_session() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai/state")).unwrap();
+        let agent = make_agent_at(dir.path());
+        agent.session_finish("task1", "result1", true, 2);
+
+        let path = dir.path().join(".ai/state/last_session.md");
+        assert!(path.exists());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("Session #42"));
+        assert!(content.contains("result1"));
+    }
+
+    #[test]
+    fn session_finish_skipped_for_sub_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        use crate::config::{AgentConfig, Role};
+        let agent = SweAgent::new_with_depth(
+            AgentConfig::default(), &dir.path().to_string_lossy(), 10, Role::Default, 1
+        ).unwrap();
+        // depth=1 — should NOT write any files
+        agent.session_finish("task", "summary", true, 5);
+        assert!(!dir.path().join(".ai/logs").exists(), "sub-agents must not write logs");
+    }
+
+    #[test]
+    fn last_session_compressed_when_over_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".ai/state")).unwrap();
+
+        // Pre-fill last_session.md with 210 lines
+        let existing = (0..210).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        std::fs::write(dir.path().join(".ai/state/last_session.md"), &existing).unwrap();
+
+        let agent = make_agent_at(dir.path());
+        agent.session_finish("task", "new summary", true, 1);
+
+        let content = std::fs::read_to_string(dir.path().join(".ai/state/last_session.md")).unwrap();
+        assert!(content.contains("compressed"), "must contain compression marker");
+        assert!(content.contains("new summary"), "must contain the new entry");
     }
 }

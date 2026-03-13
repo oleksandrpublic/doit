@@ -13,7 +13,11 @@ use crate::agent::SweAgent;
 use crate::config::{AgentConfig, Role, ensure_global_config};
 
 #[derive(Parser)]
-#[command(name = "do_it", about = "do_it — autonomous coding agent (local LLM + ACI)")]
+#[command(
+    name = "do_it",
+    about = "do_it — autonomous coding agent (local LLM + ACI)",
+    version,
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -59,6 +63,28 @@ enum Commands {
 
     /// List available roles with their tool allowlists
     Roles,
+
+    /// Show current project status: last session, plan, wishlist, session logs
+    Status {
+        /// Path to the repository / working directory
+        #[arg(long, short, default_value = ".")]
+        repo: String,
+    },
+
+    /// Initialise .ai/ workspace in the current (or given) directory
+    Init {
+        /// Path to the repository / working directory
+        #[arg(long, short, default_value = ".")]
+        repo: String,
+
+        /// Ollama model to use (default: ask interactively, or "qwen2.5-coder:14b")
+        #[arg(long)]
+        model: Option<String>,
+
+        /// Skip interactive prompts — use all defaults
+        #[arg(long, short)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -71,34 +97,18 @@ async fn main() -> Result<()> {
         .without_time()
         .init();
 
-    // First-run init: create ~/.do_it/ with default config and system prompt
+    // First-run: create ~/.do_it/ with default global config
     ensure_global_config();
 
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Run { task, repo, config, role, system_prompt, max_steps } => {
-            // Load config: --config (explicit) > ./config.toml > ~/.do_it/config.toml > defaults
             let explicit = if config != "config.toml" { Some(config.as_str()) } else { None };
             let mut cfg = AgentConfig::load(explicit);
 
-            // Resolve role
-            let agent_role = if let Some(r) = &role {
-                match Role::from_str(r) {
-                    Some(role) => {
-                        println!("Role: {}", role.name());
-                        role
-                    }
-                    None => {
-                        eprintln!("Unknown role '{}'. Run `do_it roles` to see available roles.", r);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                Role::Default
-            };
+            let agent_role = resolve_role(role.as_deref())?;
 
-            // --task: image path, text file, or inline string
             let task_image: Option<std::path::PathBuf> = if is_image_path(&task) {
                 tracing::info!("--task: image detected '{}'", task);
                 Some(std::path::PathBuf::from(&task))
@@ -111,15 +121,10 @@ async fn main() -> Result<()> {
                 load_text_or_inline(&task, "--task")?
             };
 
-            // System prompt priority: --system-prompt > --role > config.toml > builtin
             if let Some(sp) = system_prompt {
                 cfg.system_prompt = load_text_or_inline(&sp, "--system-prompt")?;
                 tracing::info!("System prompt: CLI override");
-            } else if agent_role != Role::Default {
-                // Role prompt is resolved inside agent (needs repo root for .ai/prompts/)
-                // We pass the role and let agent.run() handle it
             }
-            // else: cfg.system_prompt stays as loaded from config.toml
 
             tracing::info!("Model: {} | Repo: {} | Role: {}", cfg.model, repo, agent_role.name());
             let mut agent = SweAgent::new(cfg, &repo, max_steps as usize, agent_role)?;
@@ -134,9 +139,352 @@ async fn main() -> Result<()> {
         Commands::Roles => {
             print_roles();
         }
+
+        Commands::Status { repo } => {
+            cmd_status(&repo)?;
+        }
+
+        Commands::Init { repo, model, yes } => {
+            cmd_init(&repo, model.as_deref(), yes)?;
+        }
     }
 
     Ok(())
+}
+
+// ─── do_it status ─────────────────────────────────────────────────────────────
+
+fn cmd_status(repo: &str) -> Result<()> {
+    let root = std::path::PathBuf::from(repo)
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from(repo));
+    let ai = root.join(".ai");
+
+    println!("╭─ do_it status ─────────────────────────────────────────────╮");
+    println!("│ repo: {}", root.display());
+    println!("╰────────────────────────────────────────────────────────────╯");
+    println!();
+
+    if !ai.exists() {
+        println!("  ⚠  No .ai/ workspace found.");
+        println!("     Run `do_it init` to initialise one.");
+        return Ok(());
+    }
+
+    // ── Session counter ────────────────────────────────────────────────────
+    let counter_path = ai.join("state/session_counter.txt");
+    let session_n: u64 = std::fs::read_to_string(&counter_path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    println!("  Sessions run: {session_n}");
+
+    // ── Session logs ───────────────────────────────────────────────────────
+    let logs_dir = ai.join("logs");
+    let mut session_logs: Vec<std::path::PathBuf> = std::fs::read_dir(&logs_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("session-") && n.ends_with(".md"))
+                .unwrap_or(false)
+        })
+        .collect();
+    session_logs.sort();
+
+    if session_logs.is_empty() {
+        println!("  Session logs: none");
+    } else {
+        println!("  Session logs ({} total):", session_logs.len());
+        // Show last 5
+        for log in session_logs.iter().rev().take(5) {
+            let name = log.file_name().unwrap_or_default().to_string_lossy();
+            let size = std::fs::metadata(log).map(|m| m.len()).unwrap_or(0);
+            println!("    • {} ({} bytes)", name, size);
+        }
+        if session_logs.len() > 5 {
+            println!("    … and {} older logs", session_logs.len() - 5);
+        }
+    }
+
+    println!();
+
+    // ── Last session ───────────────────────────────────────────────────────
+    let last_session_path = ai.join("state/last_session.md");
+    println!("── Last session ──────────────────────────────────────────────");
+    match std::fs::read_to_string(&last_session_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            let lines: Vec<&str> = content.lines().collect();
+            for line in lines.iter().take(40) {
+                println!("  {line}");
+            }
+            if lines.len() > 40 {
+                println!("  … ({} more lines)", lines.len() - 40);
+            }
+        }
+        _ => println!("  (no last_session.md — first run or cleared)"),
+    }
+    println!();
+
+    // ── Plan ───────────────────────────────────────────────────────────────
+    let plan_path = ai.join("state/current_plan.md");
+    println!("── Current plan ──────────────────────────────────────────────");
+    match std::fs::read_to_string(&plan_path) {
+        Ok(content) if !content.trim().is_empty() => {
+            let count = content.lines().count();
+            for line in content.lines().take(30) {
+                println!("  {line}");
+            }
+            if count > 30 {
+                println!("  … (see .ai/state/current_plan.md for full plan)");
+            }
+        }
+        _ => println!("  (no plan yet)"),
+    }
+    println!();
+
+    // ── Tool wishlist ──────────────────────────────────────────────────────
+    println!("── Tool wishlist (~/.do_it/tool_wishlist.md) ─────────────────");
+    let wishlist = config::global_tool_wishlist_path()
+        .and_then(|p| std::fs::read_to_string(&p).ok());
+    match wishlist {
+        Some(content) if !content.trim().is_empty() => {
+            let entries: Vec<&str> = content
+                .split("\n## ")
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            println!("  {} request(s) total", entries.len());
+            for entry in entries.iter().rev().take(3) {
+                let title = entry.lines().next()
+                    .unwrap_or("")
+                    .trim_start_matches("## ")
+                    .trim();
+                println!("  • {title}");
+            }
+            if entries.len() > 3 {
+                println!("  … (see ~/.do_it/tool_wishlist.md for full list)");
+            }
+        }
+        _ => println!("  (empty)"),
+    }
+    println!();
+
+    // ── Knowledge keys ─────────────────────────────────────────────────────
+    let knowledge_dir = ai.join("knowledge");
+    if knowledge_dir.exists() {
+        let mut keys: Vec<String> = std::fs::read_dir(&knowledge_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                    p.file_stem().and_then(|s| s.to_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        keys.sort();
+
+        if !keys.is_empty() {
+            println!("── Knowledge keys (.ai/knowledge/) ───────────────────────────");
+            for key in &keys {
+                println!("  • {key}");
+            }
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+// ─── do_it init ───────────────────────────────────────────────────────────────
+
+const AI_SUBDIRS: &[&str] = &["state", "logs", "knowledge", "prompts", "tools", "screenshots"];
+
+fn cmd_init(repo: &str, model_arg: Option<&str>, yes: bool) -> Result<()> {
+    let root = std::path::PathBuf::from(repo);
+    let ai = root.join(".ai");
+
+    let display_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+    println!("╭─ do_it init ────────────────────────────────────────────────╮");
+    println!("│ repo: {}", display_root.display());
+    println!("╰────────────────────────────────────────────────────────────╯");
+    println!();
+
+    // ── Create .ai/ directory structure ───────────────────────────────────
+    for sub in AI_SUBDIRS {
+        let dir = ai.join(sub);
+        let existed = dir.exists();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| anyhow::anyhow!("Cannot create .ai/{sub}/: {e}"))?;
+        if existed {
+            println!("  ✓ exists   .ai/{sub}/");
+        } else {
+            println!("  ✓ created  .ai/{sub}/");
+        }
+    }
+    println!();
+
+    // ── Resolve model ──────────────────────────────────────────────────────
+    let model = if let Some(m) = model_arg {
+        m.to_string()
+    } else if yes {
+        "qwen2.5-coder:14b".to_string()
+    } else {
+        prompt_input("Ollama model to use", "qwen2.5-coder:14b")
+    };
+
+    // ── Write config.toml ─────────────────────────────────────────────────
+    let config_path = root.join("config.toml");
+    if config_path.exists() {
+        println!("  ✓ exists   config.toml (not overwritten)");
+    } else {
+        let config_content = format!(
+            r#"# do_it configuration — generated by `do_it init`
+
+model         = "{model}"
+ollama_url    = "http://127.0.0.1:11434"
+max_output    = 32000
+
+# Sub-agent settings
+sub_agent_max_steps = 15
+max_depth           = 3
+
+# [telegram]
+# token   = "BOT_TOKEN"
+# chat_id = "CHAT_ID"
+
+# [browser]
+# cdp_url        = "ws://127.0.0.1:9222"
+# chrome_path    = ""
+# screenshot_dir = ".ai/screenshots"
+"#
+        );
+        std::fs::write(&config_path, config_content)
+            .map_err(|e| anyhow::anyhow!("Cannot write config.toml: {e}"))?;
+        println!("  ✓ created  config.toml  (model: {model})");
+    }
+
+    // ── Write .ai/project.toml ────────────────────────────────────────────
+    let project_path = ai.join("project.toml");
+    if project_path.exists() {
+        println!("  ✓ exists   .ai/project.toml (not overwritten)");
+    } else {
+        let project_name = if yes {
+            root.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("my-project")
+                .to_string()
+        } else {
+            prompt_input(
+                "Project name",
+                root.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("my-project"),
+            )
+        };
+
+        let project_content = format!(
+            r#"# do_it project configuration
+
+[project]
+name        = "{project_name}"
+description = ""
+language    = ""      # e.g. "Rust", "TypeScript", "Python"
+framework   = ""      # e.g. "Axum", "React", "FastAPI"
+
+[build]
+build   = ""          # e.g. "cargo build"
+test    = ""          # e.g. "cargo test"
+lint    = ""          # e.g. "cargo clippy"
+serve   = ""          # e.g. "cargo run"
+
+[conventions]
+# code_style   = "..."
+# commit_style = "conventional commits"
+"#
+        );
+        std::fs::write(&project_path, project_content)
+            .map_err(|e| anyhow::anyhow!("Cannot write .ai/project.toml: {e}"))?;
+        println!("  ✓ created  .ai/project.toml");
+    }
+
+    // ── .gitignore ────────────────────────────────────────────────────────
+    let gitignore_path = root.join(".gitignore");
+    let ai_entries = [
+        ".ai/state/",
+        ".ai/logs/",
+        ".ai/screenshots/",
+    ];
+
+    if gitignore_path.exists() {
+        let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        let missing: Vec<&str> = ai_entries.iter()
+            .copied()
+            .filter(|e| !existing.contains(e))
+            .collect();
+
+        if missing.is_empty() {
+            println!("  ✓ exists   .gitignore (do_it entries already present)");
+        } else {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&gitignore_path)
+                .map_err(|e| anyhow::anyhow!("Cannot open .gitignore: {e}"))?;
+            use std::io::Write as _;
+            writeln!(f, "\n# do_it — runtime state (do not commit)")?;
+            for entry in &missing {
+                writeln!(f, "{entry}")?;
+            }
+            println!("  ✓ updated  .gitignore (added: {})", missing.join(", "));
+        }
+    } else {
+        let content = format!(
+            "# do_it — runtime state (do not commit)\n{}\n",
+            ai_entries.join("\n")
+        );
+        std::fs::write(&gitignore_path, content)
+            .map_err(|e| anyhow::anyhow!("Cannot write .gitignore: {e}"))?;
+        println!("  ✓ created  .gitignore");
+    }
+
+    println!();
+    println!("  Workspace ready.");
+    println!("  Next step:");
+    println!("    do_it run --task \"describe your task here\" --role boss");
+    println!();
+
+    Ok(())
+}
+
+/// Simple stdin prompt with a default value shown in brackets.
+fn prompt_input(label: &str, default: &str) -> String {
+    use std::io::Write as _;
+    print!("  {label} [{}]: ", default);
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok();
+    let trimmed = line.trim();
+    if trimmed.is_empty() { default.to_string() } else { trimmed.to_string() }
+}
+
+// ─── Shared helpers ────────────────────────────────────────────────────────────
+
+fn resolve_role(role: Option<&str>) -> Result<Role> {
+    match role {
+        None => Ok(Role::Default),
+        Some(r) => Role::from_str(r).ok_or_else(|| {
+            eprintln!("Unknown role '{}'. Run `do_it roles` to see available roles.", r);
+            anyhow::anyhow!("Unknown role: {r}")
+        }),
+    }
 }
 
 fn print_roles() {
@@ -165,7 +513,6 @@ fn print_roles() {
     println!("Prompt: .ai/prompts/<role>.md overrides built-in prompt");
 }
 
-/// Recognised image extensions
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp"];
 
 fn is_image_path(value: &str) -> bool {

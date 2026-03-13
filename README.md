@@ -20,6 +20,8 @@ Most of the new features were designed and implemented by [Claude Sonnet 4.6](ht
 - **Agent roles** — focused tool sets and prompts per task type: `developer`, `navigator`, `qa`, `boss`, `research`, `reviewer`, `memory`
 - **Sub-agent orchestration** — `boss` role delegates to specialised sub-agents via `spawn_agent`; results flow through shared memory
 - **Persistent memory** — `.ai/` hierarchy: session notes, task plan, knowledge base, architectural decisions, lessons learned. Global `~/.do_it/` memory for user preferences and cross-project boss insights
+- **Browser integration** — headless browser tools (`screenshot`, `browser_get_text`, `browser_action`, `browser_navigate`) via CDP; connect Chrome or Lightpanda by setting `cdp_url` in config
+- **Agent self-improvement** — `tool_request` and `capability_gap` tools let the Boss record missing capabilities to `~/.do_it/tool_wishlist.md`; review to prioritise new tool development
 - **Project auto-detection** — `.ai/project.toml` scaffolded on first run with commands, GitHub repo, and agent conventions
 - **GitHub integration** — `github_api` tool for issues, PRs, branches, commits, file contents (token from env)
 - **Test coverage** — `test_coverage` auto-detects Rust/Node/Python and runs the right tool
@@ -57,12 +59,12 @@ Each role restricts the agent to a focused set of tools and a role-specific syst
 
 | Role | Purpose | Key tools |
 |---|---|---|
-| `developer` | Write and edit code | read/write file, str_replace, run_command, git, AST, github_api, test_coverage |
+| `developer` | Write and edit code | read/write file, str_replace, run_command, git, AST, github_api, test_coverage, browser |
 | `navigator` | Explore codebase structure | tree, find_files, search, outline, find_references |
 | `research` | Find information | web_search, fetch_url, memory |
-| `qa` | Run tests, verify changes | test_coverage, diff_repo, git_log, search, github_api |
-| `reviewer` | Static code review — no execution | read_file, search, outline, diff_repo, memory |
-| `boss` | Plan and orchestrate | memory, spawn_agent, web_search, ask_human, notify |
+| `qa` | Run tests, verify changes | test_coverage, diff_repo, git_log, search, github_api, screenshot |
+| `reviewer` | Static code review — no execution | read_file, search, outline, diff_repo, memory, screenshot |
+| `boss` | Plan and orchestrate | memory, spawn_agent, web_search, ask_human, browser, tool_request |
 | `memory` | Manage `.ai/` state | memory_read, memory_write |
 
 ```bash
@@ -90,6 +92,10 @@ do_it roles   # list all roles and their tool allowlists
 
 **Multi-agent:** `spawn_agent`
 
+**Browser** (requires `[browser]` in config.toml): `screenshot`, `browser_get_text`, `browser_action`, `browser_navigate`
+
+**Self-improvement:** `tool_request`, `capability_gap`
+
 ---
 
 ## Sub-agent Orchestration
@@ -106,6 +112,7 @@ boss: reads last_session, plan, decisions, user_profile
   ├─ spawn_agent("research",  "find best OAuth crates for Axum",    memory_key="knowledge/oauth")
   ├─ spawn_agent("navigator", "locate existing auth middleware",     memory_key="knowledge/structure")
   ├─ spawn_agent("developer", "implement OAuth per the plan")
+  ├─ screenshot("http://localhost:3080/login")   ← boss sees the result directly
   ├─ spawn_agent("reviewer",  "review the OAuth implementation",    memory_key="knowledge/review_report")
   ├─ spawn_agent("qa",        "verify all tests pass",              memory_key="knowledge/qa_report")
   └─ notify("OAuth complete, all tests pass") → finish
@@ -137,6 +144,7 @@ Global memory in `~/.do_it/` persists across all projects and is read by the `bo
 |---|---|
 | `user_profile.md` | Your preferences: language, stack, workflow style. Boss reads this every session. |
 | `boss_notes.md` | Cross-project insights accumulated by Boss — patterns that apply beyond the current repo. |
+| `tool_wishlist.md` | Missing capabilities recorded by the agent via `tool_request` and `capability_gap`. Review to prioritise new tool development. |
 
 Edit `~/.do_it/user_profile.md` once and the boss will always know your stack and conventions.
 
@@ -165,10 +173,35 @@ execution = "qwen3.5:4b"
 ```
 
 Config priority: `--config` flag → `./config.toml` → `~/.do_it/config.toml` → built-in defaults.
-On first run, `~/.do_it/` is created with a full template.
+On first run, `~/.do_it/` is created with a full template including `user_profile.md`, `boss_notes.md`, and `tool_wishlist.md`.
 
 ```bash
 do_it config   # show resolved config
+```
+
+### Browser backend (optional)
+
+```toml
+[browser]
+# Connect to a running CDP server — Chrome, Lightpanda, or any CDP-compatible browser
+cdp_url = "ws://127.0.0.1:9222"
+
+# Or launch Chrome locally (coming soon — requires chromiumoxide feature)
+# chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+
+# Screenshot output directory (default: .ai/screenshots)
+# screenshot_dir = ".ai/screenshots"
+```
+
+Start a CDP server:
+```bash
+# Chrome
+google-chrome --headless --remote-debugging-port=9222
+
+# Lightpanda (lightweight, AI-optimised, 9x less RAM than Chrome)
+lightpanda serve --host 127.0.0.1 --port 9222
+# or via Docker:
+docker run -d -p 9222:9222 lightpanda/browser:nightly
 ```
 
 ---
@@ -192,10 +225,12 @@ do_it roles
 ## Roadmap
 
 - [ ] `git_push` / `git_pull` structured tools
-- [ ] Parallel sub-agent execution
-- [ ] Web search providers beyond DuckDuckGo
+- [ ] `run_background(program, args, id)` — dev servers, keep-alive processes
+- [ ] Browser CDP implementation (chromiumoxide backend behind `--features browser`)
+- [ ] Parallel sub-agent execution via `tokio::join!`
+- [ ] `do_it status` / `do_it init` CLI commands
 - [ ] Tree-sitter backend for more accurate AST analysis
-- [ ] Browser/screenshot tool (watching developments from major providers)
+- [ ] Web search providers beyond DuckDuckGo
 
 ---
 

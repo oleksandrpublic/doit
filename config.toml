@@ -82,3 +82,22 @@ Your goal is to solve programming tasks by using a set of tools to interact with
 #
 # telegram_token   = "1234567890:ABCdef..."
 # telegram_chat_id = "123456789"
+
+# ─── Browser backend (optional) ───────────────────────────────────────────────
+# Enables browser tools: screenshot, browser_get_text, browser_action, browser_navigate.
+# Without this section, browser tools return a setup message instead of an error.
+#
+# The agent speaks CDP (Chrome DevTools Protocol) — the backend is transparent.
+# Swap cdp_url to change from Chrome to Lightpanda or any future CDP-compatible browser.
+#
+# Option 1: connect to a running CDP server
+#   - Chrome:     google-chrome --headless --remote-debugging-port=9222
+#   - Lightpanda: lightpanda serve --host 127.0.0.1 --port 9222
+#   - Docker:     docker run -d -p 9222:9222 lightpanda/browser:nightly
+#
+# Option 2: let the agent launch Chrome locally (requires chromiumoxide feature, coming soon)
+#
+# [browser]
+# cdp_url        = "ws://127.0.0.1:9222"
+# # chrome_path  = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+# # screenshot_dir = ".ai/screenshots"   # default: .ai/screenshots
