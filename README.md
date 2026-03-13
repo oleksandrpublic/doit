@@ -218,17 +218,15 @@ do_it run    --task <text|file|image>
 
 do_it config [--config <path>]
 do_it roles
+do_it status
+do_it init
 ```
 
 ---
 
 ## Roadmap
 
-- [ ] `git_push` / `git_pull` structured tools
-- [ ] `run_background(program, args, id)` — dev servers, keep-alive processes
 - [ ] Browser CDP implementation (chromiumoxide backend behind `--features browser`)
-- [ ] Parallel sub-agent execution via `tokio::join!`
-- [ ] `do_it status` / `do_it init` CLI commands
 - [ ] Tree-sitter backend for more accurate AST analysis
 - [ ] Web search providers beyond DuckDuckGo
 
