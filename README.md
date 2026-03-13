@@ -17,13 +17,15 @@ Most of the new features were designed and implemented by [Claude Sonnet 4.6](ht
 
 - **Local-first** — runs entirely on your machine via Ollama, no cloud APIs required
 - **Cross-platform** — Windows (MSVC) and Linux, no shell operators, no Python
-- **Agent roles** — focused tool sets and prompts per task type: `developer`, `navigator`, `qa`, `boss`, `research`, `reviewer`, `memory`
-- **Sub-agent orchestration** — `boss` role delegates to specialised sub-agents via `spawn_agent`; results flow through shared memory
+- **Agent roles** — focused tool sets and prompts per task type: `boss`, `research`, `developer`, `navigator`, `qa`, `reviewer`, `memory`
+- **Sub-agent orchestration** — `boss` role delegates to specialised sub-agents via `spawn_agent` or `spawn_agents` (parallel); results flow through shared memory
 - **Persistent memory** — `.ai/` hierarchy: session notes, task plan, knowledge base, architectural decisions, lessons learned. Global `~/.do_it/` memory for user preferences and cross-project boss insights
 - **Browser integration** — headless browser tools (`screenshot`, `browser_get_text`, `browser_action`, `browser_navigate`) via CDP; connect Chrome or Lightpanda by setting `cdp_url` in config
+- **Background processes** — run long-running processes in the background with `run_background`, check status with `process_status`, kill with `process_kill`
 - **Agent self-improvement** — `tool_request` and `capability_gap` tools let the Boss record missing capabilities to `~/.do_it/tool_wishlist.md`; review to prioritise new tool development
 - **Project auto-detection** — `.ai/project.toml` scaffolded on first run with commands, GitHub repo, and agent conventions
 - **GitHub integration** — `github_api` tool for issues, PRs, branches, commits, file contents (token from env)
+- **Git tools** — full Git support including `git_pull`, `git_push`, `git_stash`, etc.
 - **Test coverage** — `test_coverage` auto-detects Rust/Node/Python and runs the right tool
 - **Telegram notifications** — `ask_human` for blocking questions, `notify` for non-blocking progress updates
 - **Loop detection** — automatically detects stuck patterns and sends a Telegram alert
@@ -59,13 +61,14 @@ Each role restricts the agent to a focused set of tools and a role-specific syst
 
 | Role | Purpose | Key tools |
 |---|---|---|
-| `developer` | Write and edit code | read/write file, str_replace, run_command, git, AST, github_api, test_coverage, browser |
-| `navigator` | Explore codebase structure | tree, find_files, search, outline, find_references |
-| `research` | Find information | web_search, fetch_url, memory |
-| `qa` | Run tests, verify changes | test_coverage, diff_repo, git_log, search, github_api, screenshot |
-| `reviewer` | Static code review — no execution | read_file, search, outline, diff_repo, memory, screenshot |
-| `boss` | Plan and orchestrate | memory, spawn_agent, web_search, ask_human, browser, tool_request |
-| `memory` | Manage `.ai/` state | memory_read, memory_write |
+| `default` | No restrictions | all tools |
+| `boss` | Orchestration — plans tasks, delegates to sub-agents | `memory_read/write`, `tree`, `web_search`, `ask_human`, `spawn_agent`, `notify` |
+| `research` | Information gathering | `web_search`, `fetch_url`, `memory_read/write`, `ask_human` |
+| `developer` | Reading and writing code | `read/write_file`, `str_replace`, `run_command`, `diff_repo`, `git_*`, AST tools, `github_api`, `test_coverage`, `notify` |
+| `navigator` | Exploring codebase structure | `tree`, `list_dir`, `find_files`, `search_in_files`, `find_references`, AST tools |
+| `qa` | Testing and verification | `run_command`, `read_file`, `search_in_files`, `diff_repo`, `git_status`, `git_log`, `github_api`, `test_coverage`, `notify` |
+| `reviewer` | Static code review — no execution | `read_file`, `search_in_files`, `find_references`, AST tools, `diff_repo`, `git_log`, `memory_read/write`, `ask_human` |
+| `memory` | Managing `.ai/` state | `memory_read`, `memory_write` |
 
 ```bash
 do_it roles   # list all roles and their tool allowlists
@@ -75,26 +78,40 @@ do_it roles   # list all roles and their tool allowlists
 
 ## Tools
 
-**Filesystem:** `read_file`, `write_file`, `str_replace`, `list_dir`, `find_files`, `search_in_files`, `tree`
+All tools are implemented in native Rust with no shell dependency.
 
-**Execution:** `run_command`, `diff_repo`, `test_coverage`
+### Filesystem
+`read_file`, `write_file`, `str_replace`, `list_dir`, `find_files`, `search_in_files`, `tree`
 
-**Git:** `git_status`, `git_commit`, `git_log`, `git_stash`
+### Execution
+`run_command`, `diff_repo`, `run_background`, `process_status`, `process_kill`, `process_list`
 
-**Internet:** `web_search` (DuckDuckGo, no API key), `fetch_url`, `github_api`
+### Git
+`git_status`, `git_commit`, `git_log`, `git_stash`, `git_pull`, `git_push`
 
-**Code intelligence** (Rust, TypeScript, JavaScript, Python, C++, Kotlin):
+### Internet
+`web_search` (DuckDuckGo, no API key), `fetch_url`, `github_api`
+
+### Code Intelligence (Rust, TypeScript, JavaScript, Python, C++, Kotlin)
 `get_symbols`, `outline`, `get_signature`, `find_references`
 
-**Memory** (`.ai/` hierarchy): `memory_read`, `memory_write`
+### Testing
+`test_coverage` (auto-detects Rust/Node/Python)
 
-**Communication:** `ask_human` (Telegram or console), `notify` (one-way Telegram), `finish`
+### Memory (.ai/ hierarchy)
+`memory_read`, `memory_write`
 
-**Multi-agent:** `spawn_agent`
+### Communication
+`ask_human` (Telegram or console), `notify` (one-way Telegram), `finish`
 
-**Browser** (requires `[browser]` in config.toml): `screenshot`, `browser_get_text`, `browser_action`, `browser_navigate`
+### Multi-agent
+`spawn_agent`, `spawn_agents`
 
-**Self-improvement:** `tool_request`, `capability_gap`
+### Browser (requires [browser] in config.toml)
+`screenshot`, `browser_get_text`, `browser_action`, `browser_navigate`
+
+### Self-improvement
+`tool_request`, `capability_gap`
 
 ---
 
@@ -226,17 +243,13 @@ do_it init
 
 ## Roadmap
 
-- [ ] Browser CDP implementation (chromiumoxide backend behind `--features browser`)
+- [ ] Session reports and metrics tracking
+- [ ] `do_it init` command for project setup
+- [ ] `do_it status` command for project overview
+- [ ] Ollama streaming support for real-time output
+- [ ] GitHub Actions CI/CD
+- [ ] Improved HTML extraction for `fetch_url` (readability algorithm)
 - [ ] Tree-sitter backend for more accurate AST analysis
-- [ ] Web search providers beyond DuckDuckGo
-
----
-
-## Authors
-
-Project concept inspired by [mini-swe-agent](https://mini-swe-agent.com/latest/).
-Built by [Claude Sonnet 4.6](https://www.anthropic.com/claude) with <oleksandr.public@gmail.com>.
-
-## License
-
-MIT
+- [ ] Structured tool schemas (JSON Schema for function calling)
+- [ ] Web search providers beyond DuckDuckGo (SearXNG, Brave Search API)
+````

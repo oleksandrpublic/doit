@@ -287,6 +287,15 @@ All tools are implemented in native Rust (`src/tools.rs`) with no shell dependen
 | `run_command` | `program`, `args[]`, `cwd?` | Run a program with explicit args array (no shell) |
 | `diff_repo` | `base?`, `staged?`, `stat?` | Git diff vs HEAD or any ref |
 
+### Background Processes
+
+| Tool | Arguments | Description |
+|---|---|---|
+| `run_background` | `program`, `args[]`, `cwd?`, `id` | Start a process in the background with a named ID |
+| `process_status` | `id` | Check if a background process is still running |
+| `process_kill` | `id` | Terminate a background process |
+| `process_list` |  | List all active background processes |
+
 ### Git
 
 | Tool | Arguments | Description |
@@ -295,6 +304,8 @@ All tools are implemented in native Rust (`src/tools.rs`) with no shell dependen
 | `git_commit` | `message`, `files?`, `allow_empty?` | Stage files and commit |
 | `git_log` | `n?`, `path?`, `oneline?` | Commit history, optionally filtered by path |
 | `git_stash` | `action`, `message?`, `index?` | Stash management: `push`, `pop`, `list`, `drop`, `show` |
+| `git_pull` | `remote?`, `branch?` | Pull from remote repository |
+| `git_push` | `remote?`, `branch?`, `force?` | Push to remote repository |
 
 ### Internet
 
@@ -385,6 +396,7 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 | Tool | Arguments | Description |
 |---|---|---|
 | `spawn_agent` | `role`, `task`, `memory_key?`, `max_steps?` | Delegate a subtask to a specialised sub-agent |
+| `spawn_agents` | `agents[]` | Spawn multiple sub-agents in parallel |
 
 ### Browser
 
@@ -823,7 +835,7 @@ Both files are created with commented templates on first run. They are only inje
 
 **Vision** — qwen3.5 supports images, but current GGUF files in Ollama may not include the mmproj component. Use llama.cpp directly for guaranteed vision support.
 
-**`spawn_agent`** — sub-agents run sequentially (one at a time). Parallel execution is not yet supported.
+**`spawn_agent`** — sub-agents run sequentially by default. Use `spawn_agents` for parallel execution.
 
 ---
 
