@@ -90,6 +90,7 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(
             EnvFilter::from_default_env()
                 .add_directive("do_it=debug".parse()?),
