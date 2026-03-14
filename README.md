@@ -43,7 +43,10 @@ ollama pull qwen3.5:9b
 # 2. Install
 cargo install do_it
 
-# 3. Run
+# 3. Initialise workspace (creates .ai/ and config.toml)
+do_it init
+
+# 4. Run
 do_it run --task "Find and fix the bug in src/parser.rs" --repo /path/to/project
 
 # With a role (recommended)
@@ -243,13 +246,12 @@ do_it init
 
 ## Roadmap
 
-- [ ] Session reports and metrics tracking
-- [ ] `do_it init` command for project setup
-- [ ] `do_it status` command for project overview
+- [x] Session reports and metrics tracking (logs/history.md, memory compression)
+- [x] `do_it init` command for project setup
+- [x] `do_it status` command for project overview
 - [ ] Ollama streaming support for real-time output
 - [ ] GitHub Actions CI/CD
 - [ ] Improved HTML extraction for `fetch_url` (readability algorithm)
 - [ ] Tree-sitter backend for more accurate AST analysis
 - [ ] Structured tool schemas (JSON Schema for function calling)
 - [ ] Web search providers beyond DuckDuckGo (SearXNG, Brave Search API)
-````
