@@ -38,15 +38,12 @@ Most of the new features were designed and implemented by [Claude Sonnet 4.6](ht
 
 ```bash
 # 1. Pull a model
-ollama pull qwen3.5:9b
+ollama pull qwen3.5:cloud
 
 # 2. Install
 cargo install do_it
 
-# 3. Initialise workspace (creates .ai/ and config.toml)
-do_it init
-
-# 4. Run
+# 3. Run
 do_it run --task "Find and fix the bug in src/parser.rs" --repo /path/to/project
 
 # With a role (recommended)
@@ -175,7 +172,7 @@ Edit `~/.do_it/user_profile.md` once and the boss will always know your stack an
 ```toml
 # config.toml
 ollama_base_url  = "http://localhost:11434"
-model            = "qwen3.5:9b"
+model            = "qwen3.5:cloud"
 temperature      = 0.0
 max_tokens       = 4096
 history_window   = 8
@@ -183,7 +180,7 @@ max_output_chars = 6000
 
 # Optional: different models per role
 [models]
-coding    = "qwen3-coder-next"
+coding    = "qwen3-coder-next:cloud"
 search    = "qwen3.5:4b"
 execution = "qwen3.5:4b"
 
@@ -246,12 +243,22 @@ do_it init
 
 ## Roadmap
 
-- [x] Session reports and metrics tracking (logs/history.md, memory compression)
+All planned features have been implemented! 🎉
+
+### Completed
+- [x] Session reports and metrics tracking
 - [x] `do_it init` command for project setup
 - [x] `do_it status` command for project overview
-- [ ] Ollama streaming support for real-time output
-- [ ] GitHub Actions CI/CD
-- [ ] Improved HTML extraction for `fetch_url` (readability algorithm)
-- [ ] Tree-sitter backend for more accurate AST analysis
-- [ ] Structured tool schemas (JSON Schema for function calling)
-- [ ] Web search providers beyond DuckDuckGo (SearXNG, Brave Search API)
+- [x] Ollama streaming support for real-time output
+- [x] GitHub Actions CI/CD
+- [x] Improved HTML extraction for `fetch_url` (readability algorithm)
+- [x] Tree-sitter backend for more accurate AST analysis
+- [x] Structured tool schemas (JSON Schema for function calling)
+- [x] Web search providers beyond DuckDuckGo (SearXNG, Brave Search API)
+
+### Future Enhancements
+- [ ] Multi-workspace support for monorepos
+- [ ] Plugin system for runtime tool loading
+- [ ] Vision model integration (LLaVA) for image analysis
+- [ ] Prompt hot-reload without rebuild
+````

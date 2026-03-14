@@ -34,7 +34,7 @@ Runs on Windows and Linux with no shell dependency, no Python, no cloud APIs.
 
 ```bash
 # 1. Pull a model
-ollama pull qwen3.5:9b
+ollama pull qwen3.5:cloud
 
 # 2. Install
 cargo install do_it
@@ -82,7 +82,7 @@ cargo install do_it
 ### Ollama setup
 
 ```bash
-ollama pull qwen3.5:9b   # recommended default
+ollama pull qwen3.5:cloud   # recommended default
 ollama list              # verify installed models
 curl http://localhost:11434/api/tags  # verify Ollama is running
 ```
@@ -105,7 +105,7 @@ On first run, `~/.do_it/` is created with a default `config.toml` and a `system_
 ollama_base_url  = "http://localhost:11434"
 
 # Default model — used when no role-specific override is set
-model            = "qwen3.5:9b"
+model            = "qwen3.5:cloud"
 
 # Sampling temperature: 0.0 = deterministic
 temperature      = 0.0
@@ -128,11 +128,11 @@ system_prompt = """..."""
 
 # Optional: per-role model overrides
 [models]
-# thinking  = "qwen3.5:9b"
-# coding    = "qwen3-coder-next"
+# thinking  = "qwen3.5:cloud"
+# coding    = "qwen3-coder-next:cloud"
 # search    = "qwen3.5:4b"
 # execution = "qwen3.5:4b"
-# vision    = "qwen3.5:9b"
+# vision    = "qwen3.5:cloud"
 ```
 
 ### Defaults
@@ -140,7 +140,7 @@ system_prompt = """..."""
 | Field | Default |
 |---|---|
 | `ollama_base_url` | `http://localhost:11434` |
-| `model` | `qwen3.5:9b` |
+| `model` | `qwen3.5:cloud` |
 | `temperature` | `0.0` |
 | `max_tokens` | `4096` |
 | `history_window` | `8` |
@@ -668,17 +668,17 @@ A tool error does not stop the agent — it is recorded in history as a failed s
 | Model | Size | Use case |
 |---|---|---|
 | `qwen3.5:4b` | 3.4 GB | Roles with ≤8 tools (navigator, research) |
-| `qwen3.5:9b` | 6.6 GB | Default — good balance |
+| `qwen3.5:cloud` | 6.6 GB | Default — good balance |
 | `qwen3.5:27b` | 17 GB | Complex multi-step tasks |
-| `qwen3-coder-next` | ~52 GB | Developer role, best code quality |
+| `qwen3-coder-next:cloud` | ~52 GB | Developer role, best code quality |
 
 ### Per-role model routing
 
 ```toml
-model = "qwen3.5:9b"   # fallback for all roles
+model = "qwen3.5:cloud"   # fallback for all roles
 
 [models]
-coding    = "qwen3-coder-next"   # used for write_file, str_replace
+coding    = "qwen3-coder-next:cloud"   # used for write_file, str_replace
 search    = "qwen3.5:4b"        # used for read_file, find_files, etc.
 execution = "qwen3.5:4b"        # used for run_command
 ```
@@ -912,7 +912,7 @@ curl http://localhost:11434/api/tags
 
 **`Model 'X' not found`**
 ```bash
-ollama pull qwen3.5:9b
+ollama pull qwen3.5:cloud
 ollama list
 ```
 

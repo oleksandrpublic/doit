@@ -326,7 +326,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             ollama_base_url: "http://localhost:11434".to_string(),
-            model: "qwen3.5:9b".to_string(),
+            model: "qwen3.5:cloud".to_string(),
             models: ModelRouter::default(),
             temperature: 0.0,
             max_tokens: 4096,
@@ -474,18 +474,18 @@ pub fn ensure_global_config() {
 # Local config.toml always takes precedence.
 
 ollama_base_url  = "http://localhost:11434"
-model            = "qwen3.5:9b"
+model            = "qwen3.5:cloud"
 temperature      = 0.0
 max_tokens       = 4096
 history_window   = 8
 max_output_chars = 6000
 
 [models]
-# thinking  = "qwen3.5:9b"
-# coding    = "qwen3-coder-next"
-# search    = "qwen3.5:4b"
-# execution = "qwen3.5:4b"
-# vision    = "qwen3.5:9b"
+# thinking  = "qwen3.5:cloud"
+# coding    = "qwen3-coder-next:cloud"
+# search    = "qwen3.5:9b"
+# execution = "qwen3.5:9b"
+# vision    = "qwen3.5:cloud"
 
 # telegram_token   = "1234567890:ABCdef..."
 # telegram_chat_id = "123456789"

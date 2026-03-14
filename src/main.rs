@@ -77,7 +77,7 @@ enum Commands {
         #[arg(long, short, default_value = ".")]
         repo: String,
 
-        /// Ollama model to use (default: ask interactively, or "qwen3.5:cloud")
+        /// Ollama model to use (default: ask interactively, or "qwen2.5-coder:14b")
         #[arg(long)]
         model: Option<String>,
 
@@ -90,7 +90,6 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_ansi(false)
         .with_env_filter(
             EnvFilter::from_default_env()
                 .add_directive("do_it=debug".parse()?),
@@ -337,9 +336,9 @@ fn cmd_init(repo: &str, model_arg: Option<&str>, yes: bool) -> Result<()> {
     let model = if let Some(m) = model_arg {
         m.to_string()
     } else if yes {
-        "qwen3.5:cloud".to_string()
+        "qwen2.5-coder:14b".to_string()
     } else {
-        prompt_input("Ollama model to use", "qwen3.5:cloud")
+        prompt_input("Ollama model to use", "qwen2.5-coder:14b")
     };
 
     // ── Write config.toml ─────────────────────────────────────────────────
@@ -393,11 +392,11 @@ Your goal is to solve programming tasks by using a set of tools to interact with
 
 # Optional: different models per role
 # [models]
-# thinking = "qwen3.5:9b"
-# coding   = "qwen3-coder-next"
-# search    = "qwen3.5:4b"
-# execution = "qwen3.5:4b"
-# vision    = "qwen3.5:9b"
+# thinking = "qwen3.5:cloud"
+# coding   = "qwen3-coder-next:cloud"
+# search    = "qwen3.5:9b"
+# execution = "qwen3.5:9b"
+# vision    = "qwen3.5:cloud"
 
 # Optional: Telegram for ask_human and notify
 # telegram_token   = "BOT_TOKEN"

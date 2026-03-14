@@ -1,4 +1,5 @@
 use anyhow::Result;
+use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::config::{AgentConfig, ModelRole, ModelRouter, Role,
@@ -370,11 +371,11 @@ impl SweAgent {
 
         if action.tool == "finish" {
             let summary = action.args.get("summary")
-                .and_then(|v| v.as_str())
+                .and_then(|v: &Value| v.as_str())
                 .unwrap_or("(no summary)")
                 .to_string();
             let success = action.args.get("success")
-                .and_then(|v| v.as_bool())
+                .and_then(|v: &Value| v.as_bool())
                 .unwrap_or(false);
             return Ok(StepOutcome::Finished { summary, success });
         }
@@ -383,11 +384,6 @@ impl SweAgent {
             &action.tool,
             &action.args,
             &self.root,
-            self.max_output_chars,
-            &self.tg,
-            &self.cfg_snapshot,
-            self.max_steps / 2,
-            self.depth,
         )
         .await?;
 
@@ -418,11 +414,6 @@ impl SweAgent {
                 "notify",
                 &serde_json::json!({ "message": alert }),
                 &self.root,
-                self.max_output_chars,
-                &self.tg,
-                &self.cfg_snapshot,
-                self.max_steps / 2,
-                self.depth,
             ).await;
         }
 

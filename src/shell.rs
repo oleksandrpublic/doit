@@ -24,7 +24,7 @@ impl OllamaClient {
     }
 
     /// Vision chat — sends an image as base64 alongside the text prompt.
-    /// Requires a vision-capable model (e.g. qwen3.5:9b via llama.cpp).
+    /// Requires a vision-capable model (e.g. qwen3.5:cloud via llama.cpp).
     pub async fn chat_with_image(
         &self,
         model: &str,
