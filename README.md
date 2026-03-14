@@ -34,6 +34,22 @@ Most of the new features were designed and implemented by [Claude Sonnet 4.6](ht
 
 ---
 
+## For Those Who Like Surprises
+
+This is a program that writes itself.
+
+At the beginning, it needed help — ideas and the first steps.
+Once everything started working, the model began improving and evolving the system on its own.
+
+All you need is proper configuration and a sufficiently capable model, for example `qwen3.5:cloud`.
+And of course — constraints and oversight.
+
+Just configure it and tell it what you would like to add, improve, or change.
+
+And don’t forget to check `tool_wishlist.md`.
+
+---
+
 ## Quick Start
 
 ```bash
