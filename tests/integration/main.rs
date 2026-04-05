@@ -1,0 +1,12 @@
+mod background;
+mod commands;
+mod file_ops;
+mod git;
+mod human_test;
+mod memory;
+mod redaction;
+mod scripting;
+mod session;
+mod test_coverage;
+mod web;
+mod workspace;

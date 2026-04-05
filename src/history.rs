@@ -13,20 +13,30 @@ pub struct Turn {
 pub struct History {
     pub turns: Vec<Turn>,
     pub window: usize,
+    pub max_turns: usize,
 }
 
 impl History {
     pub fn new(window: usize) -> Self {
-        Self { turns: Vec::new(), window }
+        Self {
+            turns: Vec::new(),
+            window,
+            max_turns: 100,
+        }
     }
 
     pub fn push(&mut self, turn: Turn) {
         self.turns.push(turn);
+        // Trim in batches to amortize the O(n) cost of shifting a Vec.
+        if self.turns.len() > self.max_turns + 8 {
+            self.turns.drain(0..8);
+        }
     }
 
     /// Return the last `n` turns (excluding step-0 memory injections).
     pub fn recent_turns(&self, n: usize) -> Vec<&Turn> {
-        self.turns.iter()
+        self.turns
+            .iter()
             .filter(|t| t.step > 0)
             .rev()
             .take(n)
@@ -39,7 +49,8 @@ impl History {
     /// Format history for injection into the LLM prompt.
     /// - Turns older than `window` are collapsed to one-liners.
     /// - Recent `window` turns are shown in full.
-    pub fn format(&self) -> String {
+    /// - Each tool output is capped to keep prompts informative without exploding.
+    pub fn format(&self, max_output_chars: usize) -> String {
         if self.turns.is_empty() {
             return "(no previous steps)".to_string();
         }
@@ -58,19 +69,31 @@ impl History {
                     format!("  step {:>2} {ok} [{}] → {}", t.step, t.tool, short)
                 })
                 .collect();
-            parts.push(format!("--- earlier steps (summarized) ---\n{}", summaries.join("\n")));
+            parts.push(format!(
+                "--- earlier steps (summarized) ---\n{}",
+                summaries.join("\n")
+            ));
         }
 
         // Full detail for recent turns
         for t in &self.turns[cutoff..] {
             let ok = if t.success { "✓" } else { "✗" };
+            let output = if t.output.len() > max_output_chars {
+                format!(
+                    "{}\n...[truncated, {} chars total]",
+                    &t.output.chars().take(max_output_chars).collect::<String>(),
+                    t.output.len()
+                )
+            } else {
+                t.output.clone()
+            };
             parts.push(format!(
                 "--- step {} ---\nThought: {}\nTool: {} {ok}\nArgs: {}\nOutput:\n{}",
                 t.step,
                 t.thought,
                 t.tool,
                 serde_json::to_string(&t.args).unwrap_or_default(),
-                indent(&t.output, "  "),
+                indent(&output, "  "),
             ));
         }
 
@@ -80,9 +103,18 @@ impl History {
 
 fn first_line(s: &str, max: usize) -> String {
     let line = s.lines().next().unwrap_or("").trim();
-    if line.len() > max { format!("{}…", &line[..max]) } else { line.to_string() }
+    let mut chars = line.chars();
+    let collected: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{collected}…")
+    } else {
+        collected
+    }
 }
 
 fn indent(s: &str, prefix: &str) -> String {
-    s.lines().map(|l| format!("{prefix}{l}")).collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|l| format!("{prefix}{l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

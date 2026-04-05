@@ -1,29 +1,29 @@
-mod core;
-mod file_ops;
-mod commands;
-mod web;
-mod human;
-mod code_analysis;
-mod git;
-mod agents;
-mod test_coverage;
-mod background;
-mod browser;
-mod self_improvement;
-mod memory;
-mod workspace;
+pub mod background;
+pub mod browser;
+pub mod cleanup;
+pub mod code_analysis;
+pub mod commands;
+pub mod core;
+pub mod file_ops;
+pub mod git;
+pub mod human;
+pub mod memory;
+pub mod rate_limit;
+pub mod scripting;
+pub mod self_improvement;
+pub mod spec;
+pub mod test_coverage;
+pub mod tool_result;
+pub mod utils;
+pub mod web;
+pub mod workspace;
 
-pub use core::{ToolResult, LlmAction, TelegramConfig, dispatch, resolve, str_arg, take_arg, chrono_now};
-pub use file_ops::{read_file, write_file, str_replace, list_dir, find_files, search_in_files};
-pub use commands::run_command;
-pub use web::{fetch_url, web_search, github_api};
-pub use human::{ask_human, notify};
-pub use code_analysis::{get_symbols, outline, get_signature, find_references};
-pub use git::{git_status, git_commit, git_log, git_stash, git_pull, git_push};
-pub use agents::{spawn_agent, spawn_agents};
-pub use test_coverage::test_coverage;
-pub use background::{run_background, process_status, process_kill, process_list};
-pub use browser::{browser_screenshot, browser_get_text, browser_action, browser_navigate};
-pub use self_improvement::{tool_request, capability_gap};
-pub use memory::{memory_read, memory_write};
-pub use workspace::{diff_repo, tree};
+pub use cleanup::{cleanup_background_processes, cleanup_old_logs};
+pub use core::{LlmAction, TelegramConfig, chrono_now, dispatch_with_depth};
+pub use rate_limit::github_rate_limiter;
+pub use spec::{
+    ToolDispatchKind, ToolGroup, ToolSpec, ToolStatus, all_tool_specs, allowed_tools_for_role,
+    allowed_tools_for_role_with_groups, canonical_tool_name, extract_tool_names_from_prompt,
+    find_tool_spec, inject_tool_catalog, inject_tool_catalog_with_groups,
+    render_tool_catalog_for_role, render_tool_catalog_for_role_with_groups, tool_status,
+};

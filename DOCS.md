@@ -1,10 +1,12 @@
 # do_it — Documentation
 
-An autonomous coding agent powered by local LLMs via [Ollama](https://ollama.com). 
+An autonomous coding agent powered by local or cloud LLMs.
 
-Reads, writes, and fixes code in your repositories. 
+Reads, writes, and fixes code in your repositories.
 
-Runs on Windows and Linux with no shell dependency, no Python, no cloud APIs.
+Runs on Windows and Linux with no shell dependency, no Python.
+
+Supports **Ollama** (local), **OpenAI-compatible**, and **Anthropic-compatible** backends — including self-hosted services and providers such as MiniMax.
 
 ---
 
@@ -33,17 +35,29 @@ Runs on Windows and Linux with no shell dependency, no Python, no cloud APIs.
 ## Quick Start
 
 ```bash
-# 1. Pull a model
-ollama pull qwen3.5:cloud
-
-# 2. Install
+# 1. Install
 cargo install do_it
+
+# 2. Initialise project (interactive)
+cd /path/to/project
+do_it init
 
 # 3. Run
 do_it run --task "Find and fix the bug in src/parser.rs" --repo /path/to/project
 
 # With a role (recommended for smaller models)
 do_it run --task "Add input validation to handlers.rs" --role developer
+```
+
+With Ollama:
+```bash
+ollama pull qwen3.5:cloud
+do_it init --backend ollama --model qwen3.5:cloud --yes
+```
+
+With OpenAI or compatible:
+```bash
+do_it init --backend openai --llm-url https://api.openai.com --model gpt-4o
 ```
 
 Windows:
@@ -60,8 +74,8 @@ Windows:
 
 ### Requirements
 
-- [Rust](https://rustup.rs/) 1.85+ (edition 2024)
-- [Ollama](https://ollama.com) running locally
+- [Rust](https://rustup.rs/) 1.85+ (edition 2021)
+- An LLM backend: [Ollama](https://ollama.com) locally, or any OpenAI / Anthropic compatible service
 
 ### Build from source
 
@@ -79,13 +93,18 @@ Binary: `target/release/do_it` (Linux) / `target\release\do_it.exe` (Windows).
 cargo install do_it
 ```
 
-### Ollama setup
+### Backend setup
 
+**Ollama (local):**
 ```bash
 ollama pull qwen3.5:cloud   # recommended default
-ollama list              # verify installed models
+ollama list                 # verify installed models
 curl http://localhost:11434/api/tags  # verify Ollama is running
 ```
+
+**OpenAI or compatible service:** set `llm_url` and `llm_api_key` in `config.toml`, or run `do_it init` to generate a config interactively.
+
+**Anthropic or compatible service:** same — set `llm_backend = "anthropic"`, `llm_url`, and `llm_api_key`.
 
 ---
 
@@ -98,11 +117,14 @@ Configuration is loaded from the first file found in this priority order:
 3. `~/.do_it/config.toml` — global user config (created automatically on first run)
 4. Built-in defaults
 
-On first run, `~/.do_it/` is created with a default `config.toml` and a `system_prompt.md` template.
+On first run, `~/.do_it/` is created with a default `config.toml` and supporting files.
 
 ```toml
-# Ollama endpoint
-ollama_base_url  = "http://localhost:11434"
+# ── LLM backend ───────────────────────────────────────────────────────────────
+# llm_backend: "ollama" | "openai" | "anthropic"
+llm_backend      = "ollama"
+llm_url          = "http://localhost:11434"
+# llm_api_key    = ""          # or set LLM_API_KEY environment variable
 
 # Default model — used when no role-specific override is set
 model            = "qwen3.5:cloud"
@@ -119,32 +141,98 @@ history_window   = 8
 # Max characters in tool output before truncation
 max_output_chars = 6000
 
-# System prompt (overridden by --role and --system-prompt)
-system_prompt = """..."""
+# Logging configuration
+log_level  = "info"    # "error", "warn", "info", "debug", "trace"
+log_format = "text"    # "text", "json"
 
 # Optional: Telegram for ask_human / notify
 # telegram_token   = "1234567890:ABCdef..."
 # telegram_chat_id = "123456789"
 
-# Optional: per-role model overrides
+# Optional: per-action-type model overrides
 [models]
 # thinking  = "qwen3.5:cloud"
 # coding    = "qwen3-coder-next:cloud"
-# search    = "qwen3.5:4b"
-# execution = "qwen3.5:4b"
+# search    = "qwen3.5:9b"
+# execution = "qwen3.5:9b"
 # vision    = "qwen3.5:cloud"
 ```
+
+### Backend examples
+
+**Local Ollama (default):**
+```toml
+llm_backend = "ollama"
+llm_url     = "http://localhost:11434"
+model       = "qwen3.5:cloud"
+```
+
+**Remote Ollama:**
+```toml
+llm_backend = "ollama"
+llm_url     = "http://192.168.1.100:11434"
+model       = "qwen3.5:35b"
+```
+
+**OpenAI:**
+```toml
+llm_backend = "openai"
+llm_url     = "https://api.openai.com"
+llm_api_key = "sk-..."
+model       = "gpt-4o"
+```
+
+**Anthropic:**
+```toml
+llm_backend = "anthropic"
+llm_url     = "https://api.anthropic.com"
+llm_api_key = "sk-ant-..."
+model       = "claude-sonnet-4-5-20251001"
+```
+
+**MiniMax (OpenAI-compatible):**
+```toml
+llm_backend = "openai"
+llm_url     = "https://api.minimax.io"
+llm_api_key = "..."
+model       = "abab6.5s-chat"
+```
+
+**Local proxy without key:**
+```toml
+llm_backend = "openai"
+llm_url     = "http://localhost:20128/v1"
+model       = "my-local-model"
+# no llm_api_key needed
+```
+
+The `llm_api_key` field can also be supplied via the `LLM_API_KEY` environment variable — useful in CI or when you prefer not to store keys in config files.
 
 ### Defaults
 
 | Field | Default |
 |---|---|
-| `ollama_base_url` | `http://localhost:11434` |
+| `llm_backend` | `ollama` |
+| `llm_url` | `http://localhost:11434` |
+| `llm_api_key` | _(none — set via env if needed)_ |
 | `model` | `qwen3.5:cloud` |
 | `temperature` | `0.0` |
 | `max_tokens` | `4096` |
 | `history_window` | `8` |
 | `max_output_chars` | `6000` |
+| `log_level` | `info` |
+| `log_format` | `text` |
+
+```toml
+# Enable optional tool groups (browser, background, github)
+# tool_groups = ["browser", "github"]
+```
+
+| Group | Tools | Roles |
+|---|---|---|
+| `browser` | `screenshot`, `browser_get_text`, `browser_action`, `browser_navigate` | boss, developer, qa, reviewer |
+| `background` | `run_background`, `process_status`, `process_list`, `process_kill` | boss, developer |
+| `github` | `github_api` | developer, qa |
 
 ```bash
 do_it config              # print resolved config
@@ -157,9 +245,20 @@ do_it config --config custom.toml
 
 ```
 do_it run     Run the agent on a task
+do_it init    Initialise a project workspace
 do_it config  Print resolved config and exit
 do_it roles   List all roles with their tool allowlists
+do_it status  Show current project status
 ```
+
+`do_it status` currently summarizes:
+- session report files in `.ai/logs/`
+- structured trace files in `.ai/logs/`
+- compact path-sensitivity diagnostics from the latest structured trace, when present
+- `last_session.md`
+- `current_plan.md`
+- `~/.do_it/tool_wishlist.md`
+- knowledge keys under `.ai/knowledge/`
 
 ### `run` arguments
 
@@ -171,6 +270,19 @@ do_it roles   List all roles with their tool allowlists
 --system-prompt   Override system prompt: inline text or path to a file
 --max-steps       Maximum agent steps (default: 30)
 ```
+
+### `init` arguments
+
+```
+--repo, -r        Repository / working directory (default: .)
+--backend         LLM backend: ollama | openai | anthropic
+--llm-url         LLM service URL
+--model           Model name
+--api-key         API key (alternative: LLM_API_KEY env var)
+--yes, -y         Skip interactive prompts, use defaults
+```
+
+`do_it init` creates `.ai/` workspace, `config.toml`, `.ai/project.toml`, and `.gitignore` entries. If run without `--yes` it prompts for backend, URL, model, and API key interactively. Existing files are never overwritten.
 
 ### Examples
 
@@ -197,6 +309,10 @@ do_it run --task "Review only, do not edit" --system-prompt prompts/reviewer.md
 
 # More steps for complex tasks
 do_it run --task "Refactor auth module" --role developer --max-steps 50
+
+# Continue after interruption
+do_it run --task "continue" --max-steps 50
+
 ```
 
 `--task` and `--system-prompt`: if the value is a path to an existing file, its contents are read; if the extension is an image (`.png`, `.jpg`, `.webp`, etc.), vision mode is activated.
@@ -221,15 +337,15 @@ do_it roles   # print all roles and their allowlists
 
 ### Role table
 
-| Role | Purpose | Key tools |
+| Role | Purpose | Core tools (≤ 12–14) |
 |---|---|---|
 | `default` | No restrictions | all tools |
-| `boss` | Orchestration — plans tasks, delegates to sub-agents | `memory_read/write`, `tree`, `web_search`, `ask_human`, `spawn_agent`, `notify` |
-| `research` | Information gathering | `web_search`, `fetch_url`, `memory_read/write`, `ask_human` |
-| `developer` | Reading and writing code | `read/write_file`, `str_replace`, `run_command`, `diff_repo`, `git_*`, AST tools, `github_api`, `test_coverage`, `notify` |
-| `navigator` | Exploring codebase structure | `tree`, `list_dir`, `find_files`, `search_in_files`, `find_references`, AST tools |
-| `qa` | Testing and verification | `run_command`, `read_file`, `search_in_files`, `diff_repo`, `git_status`, `git_log`, `github_api`, `test_coverage`, `notify` |
-| `reviewer` | Static code review — no execution | `read_file`, `search_in_files`, `find_references`, AST tools, `diff_repo`, `git_log`, `memory_read/write`, `ask_human` |
+| `boss` | Orchestration — delegates everything, never writes code | `memory`, `tree`, `project_map`, `web_search`, `ask_human`, `notify`, `spawn_agent/s`, `tool_request`, `capability_gap` |
+| `research` | Information gathering | `web_search`, `fetch_url`, `memory`, `ask_human` |
+| `developer` | Write and run code — uses navigator sub-agent for exploration | `read_file`, `write_file`, `str_replace`, `apply_patch_preview`, `run_command`, `run_targeted_test`, `format_changed_files_only`, `run_script`, `git_*`, `memory`, `notify` |
+| `navigator` | Explore codebase — read-only | `read_file`, `list_dir`, `find_files`, `search_in_files`, `tree`, `get_symbols`, `outline`, `find_references`, `project_map`, `trace_call_path`, `memory` |
+| `qa` | Testing and verification | `read_file`, `search_in_files`, `run_command`, `run_script`, `diff_repo`, `read_test_failure`, `test_coverage`, `git_*`, `memory`, `notify` |
+| `reviewer` | Static code review — no execution | `read_file`, `search_in_files`, `diff_repo`, `git_log`, `get_symbols`, `outline`, `get_signature`, `find_references`, `ask_human`, `memory` |
 | `memory` | Managing `.ai/` state | `memory_read`, `memory_write` |
 
 ### System prompt priority
@@ -266,7 +382,16 @@ The file is picked up automatically — no restart needed.
 
 ## Tools
 
-All tools are implemented in native Rust (`src/tools.rs`) with no shell dependency.
+All tools are implemented in native Rust under `src/tools/`.
+
+The tool surface is no longer documented only by hand-written prompts:
+- canonical names, aliases, role availability, dispatch kind, and capability status live in a shared registry (`src/tools/spec.rs`)
+- role prompts inject their `## Available tools` section from that registry at runtime
+- generated tool catalogs mark non-real tools as:
+  - `[limited]` for stubbed tools
+  - `[experimental]` for tools with a narrower or unstable runtime contract
+
+This makes prompts, allowlists, and runtime dispatch significantly more consistent than before.
 
 ### Filesystem
 
@@ -275,26 +400,64 @@ All tools are implemented in native Rust (`src/tools.rs`) with no shell dependen
 | `read_file` | `path`, `start_line?`, `end_line?` | Read file with line numbers (default: first 100 lines) |
 | `write_file` | `path`, `content` | Overwrite file, create directories if needed |
 | `str_replace` | `path`, `old_str`, `new_str` | Replace a unique string in a file |
+| `apply_patch_preview` | `path`, `content?` or `old_str` + `new_str` | Preview an edit as a unified diff without writing it |
 | `list_dir` | `path?` | List directory contents (one level) |
 | `find_files` | `pattern`, `dir?` | Find files by name: `*.rs`, `test*`, substring |
 | `search_in_files` | `pattern`, `dir?`, `ext?` | Regex search across file contents |
 | `tree` | `dir?`, `depth?`, `ignore?` | Recursive directory tree (ignores `target`, `.git`, etc. by default) |
+
+`apply_patch_preview` is currently `[experimental]`. It supports:
+- write-style preview via `path + content`
+- targeted replace preview via `path + old_str + new_str`
+- no filesystem writes; the current file stays untouched
+- unified diff output intended for fast review before a real edit
 
 ### Execution
 
 | Tool | Arguments | Description |
 |---|---|---|
 | `run_command` | `program`, `args[]`, `cwd?` | Run a program with explicit args array (no shell) |
+| `format_changed_files_only` | `dir?`, `check_only?`, `timeout_secs?` | Format only changed Rust files detected from git status |
+| `run_targeted_test` | `path?`, `test?`, `kind?`, `target?`, `dir?` | Run a narrow Rust test target inferred from file path or explicit target |
+| `run_script` | `script`, `dir?` | Run a sandboxed Rhai script for lightweight parsing and summarization |
 | `diff_repo` | `base?`, `staged?`, `stat?` | Git diff vs HEAD or any ref |
+
+`run_script` is currently `[experimental]`. It exposes a deliberately small host API:
+- `read_lines(path)` — read file lines within the workspace
+- `regex_match(pattern, text)` — regex match helper
+- `parse_json(text)` — parse JSON into Rhai values
+- `log(msg)` — append to script logs returned in the tool result
+
+Sandbox limits:
+- 1 second wall-clock budget
+- operation, depth, string, array, and map size limits
+- output capped at 512 KB
+- no network, process spawning, or unrestricted filesystem access
+
+`run_targeted_test` is currently `[experimental]` and Rust-first:
+- `path: "src/..."` narrows to `cargo test --lib`
+- `path: "tests/<target>/..."` narrows to `cargo test --test <target>`
+- `test` adds a standard cargo test filter
+- `kind` can force `auto`, `lib`, `test`, or `package`
+- Node/Python fallback branches are intentionally deferred until the Rust-first workflow is stable
+
+`format_changed_files_only` is currently `[experimental]` and Rust-first:
+- reads changed paths from `git status --porcelain`
+- filters to changed `.rs` files only
+- runs `rustfmt` just on those files instead of the whole repo
+- `check_only: true` switches to `rustfmt --check`
+- Node/Python formatter fallbacks are intentionally deferred until the Rust-first workflow is stable
 
 ### Background Processes
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `run_background` | `program`, `args[]`, `cwd?`, `id` | Start a process in the background with a named ID |
-| `process_status` | `id` | Check if a background process is still running |
-| `process_kill` | `id` | Terminate a background process |
-| `process_list` |  | List all active background processes |
+| `run_background` | `program`, `args[]`, `cwd?`, `id`, `cmd?` | Start a named background process |
+| `process_status` | `id` or `pid` | Check if a background process is still running |
+| `process_kill` | `id` or `pid` | Terminate a background process |
+| `process_list` |  | List all tracked background processes |
+
+Current state: these tools are real. They spawn OS processes, track real PIDs, support lookup by stable `id`, and keep a recent stdout/stderr excerpt for status inspection.
 
 ### Git
 
@@ -332,7 +495,7 @@ GET  /repos/{owner}/{repo}/contents/{path}     — read file (auto-decoded)
 
 ### Code Intelligence
 
-Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected by file extension.
+Tree-sitter backend. Supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected by file extension.
 
 | Tool | Arguments | Description |
 |---|---|---|
@@ -347,9 +510,11 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `test_coverage` | `dir?`, `threshold?` | Run tests with coverage (auto-detects Rust/Node/Python) |
+| `test_coverage` | `dir?`, `threshold?`, `timeout_secs?` | Run tests with coverage (auto-detects project type). Enforces threshold (default: 80%). |
 
-`test_coverage` detects the project type from `Cargo.toml` / `package.json` / `pyproject.toml` and runs the appropriate tool (`cargo tarpaulin`, `jest --coverage`, `pytest --cov`). Falls back to `cargo test` if tarpaulin is not installed. Returns `success=false` if coverage is below `threshold` (default: 80%).
+Current state: Rust projects are supported. The tool prefers `cargo llvm-cov`, falls back to `cargo tarpaulin`, and falls back again to `cargo test` when no coverage backend is installed, returning a clear note that coverage numbers are unavailable. Non-Rust project types still return a clean "not implemented yet" result.
+
+`run_targeted_test` complements this by making the inner edit/test loop cheaper before QA runs broader coverage or full-suite verification.
 
 ### Memory (`.ai/` hierarchy)
 
@@ -400,16 +565,21 @@ Regex-based, supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. Detected
 
 ### Browser
 
-Requires `[browser]` to be configured in `config.toml`. The agent speaks CDP — the backend is transparent (Chrome, Lightpanda, or any CDP-compatible server).
+Browser tools are currently `[experimental]`.
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `screenshot` | `url`, `wait_ms?`, `full_page?` | Navigate to URL, take PNG screenshot; returns file path + base64 for vision model |
-| `browser_get_text` | `url`, `selector?`, `wait_ms?` | Fetch page text after JavaScript renders; use instead of `fetch_url` for SPAs |
-| `browser_action` | `action`, `selector`, `value?`, `wait_ms?` | Interact with an element: `click`, `type`, `hover`, `clear`, `select` |
-| `browser_navigate` | `url`, `wait_ms?` | Navigate and wait for page load; takes implicit screenshot |
+| `screenshot` | `url?`, `path?` | Optionally navigate, then save a PNG screenshot to a workspace path |
+| `browser_get_text` | `url?`, `selector?` | Read rendered text from the current page or an optionally provided URL |
+| `browser_action` | `action`, `selector?`, `value?`, `url?` | Interact with an element: `click`, `type`, `hover`, `clear`, `select`, `scroll` |
+| `browser_navigate` | `url` | Navigate and wait for page load |
 
-If `[browser]` is not configured, tools return a helpful setup message instead of failing silently.
+Current runtime behavior:
+- the implementation launches `headless_chrome` directly
+- `AgentConfig.browser` exists but is not yet the source of truth for browser startup
+- if browser startup fails, the tool returns the real startup error from the browser backend
+
+So the browser contract is usable, but the config-driven setup described below is still aspirational and not fully wired.
 
 ### Self-improvement
 
@@ -458,7 +628,7 @@ Sends a one-way message with no waiting. Used for progress updates and completio
 To send instructions to the agent before its next run, write to `.ai/state/external_messages.md`. On startup, the agent reads this file, injects it into context, and clears it. Any external process — a webhook, a cron script, another agent — can write to this file.
 
 ```bash
-echo "## 2024-01-15 10:30
+echo "## 2026-01-15 10:30
 Please also update the README after the refactor." >> .ai/state/external_messages.md
 ```
 
@@ -501,6 +671,10 @@ lightpanda serve --host 127.0.0.1 --port 9222
 docker run -d --name lightpanda -p 9222:9222 lightpanda/browser:nightly
 ```
 
+### Planned browser direction
+
+The intended direction is a config-driven CDP/browser backend with cleaner “browser not configured” messages. The current implementation is a simpler direct `headless_chrome` integration, so treat the rest of this section as the target architecture rather than a fully completed contract.
+
 ### How the agent uses browser tools
 
 ```
@@ -537,7 +711,7 @@ developer: screenshot("http://localhost:3080/login")  ← verify rendering
 do_it run --task screenshot.png --role developer
 ```
 
-If `[browser]` is not configured, all browser tools return a setup message explaining what to add to `config.toml`. They never fail silently.
+When browser startup fails, the error is surfaced explicitly. Unknown browser actions are rejected before startup so contract errors do not get masked by environment failures.
 
 ---
 
@@ -587,7 +761,7 @@ Each entry is timestamped and structured. The wishlist is your primary source fo
 
 ## How the Agent Works
 
-### Session initialisation (`src/agent.rs`)
+### Session initialisation (`src/agent/session.rs`)
 
 ```
 session_init():
@@ -628,23 +802,53 @@ if --task is an image:
   → vision model describes it → description becomes effective_task
 
 for each step 1..max_steps:
+  0. build prompt from:
+     - task
+     - working memory (`goal`, `attempted_actions`, `artifacts_found`, `blocked_on`, `next_best_action`)
+     - recent history
+     - status-aware strategy notes for weak/repeated tools
+     - project context
   1. thinking model → JSON { thought, tool, args }
-  2. check role tool allowlist (if role != Default)
-  3. if specialist model differs → re-call with specialist
-  4. execute tool
-  5. record in history
-  6. loop detection → notify if stuck
-  7. if tool == "finish" → done
+  2. canonicalize tool name through the registry
+  3. check role tool allowlist (if role != Default)
+  4. if specialist model differs → re-call with specialist
+  5. execute tool
+  6. update working memory from the tool result
+  7. record in history
+  8. loop detection / anti-loop policy
+  9. if tool == "finish" → done
 ```
 
-### Loop detection
+### Loop detection and anti-loop policy
 
-After each step the agent checks for two stuck patterns:
+The runtime now combines raw history with tool capability status from the registry:
 
-- **Repeated failures** — same tool failed 3 times in a row
-- **Repeated calls** — same tool with identical args called 4 times in a row
+- repeated identical `[limited]` tool calls trip loop handling sooner
+- repeated identical `[experimental]` tool calls trip loop handling sooner than normal tools
+- prompts include `Strategy Notes` when a weak tool already returned the same result with the same args
+- prompts also include `Working Memory`, which helps the model remember blockers and next-best actions
 
-When detected: logs a warning and sends a Telegram notification. The agent does not stop — it continues and may self-correct, but you are informed.
+The goal is to interrupt low-value repetition before the agent burns many steps on the same failing tactic.
+
+### Resume behavior
+
+Top-level sessions persist structured working memory in `.ai/state/task_state.json`.
+
+Current behavior:
+- `continue` reuses the saved top-level goal when available
+- the first prompt after restore includes resume guidance from the saved task state
+- persisted task state is restored only for the top-level agent
+- successful top-level completion clears the persisted snapshot
+- failed or interrupted top-level runs keep the snapshot for resume
+
+Sub-agents intentionally do not restore persisted task state. They start with fresh in-memory working memory so their behavior stays scoped to the current delegated task and remains reproducible.
+
+Design constraint:
+- `TaskState` is intentionally small and operational
+- it is not a full narrative session transcript
+- avoid adding extra resume metadata unless there is a proven benefit
+
+This keeps prompt pressure lower and makes the state more usable on weaker models.
 
 ### Context window (`src/history.rs`)
 
@@ -663,37 +867,57 @@ A tool error does not stop the agent — it is recorded in history as a failed s
 
 ## Model Selection and Routing
 
-### Recommended models (qwen3.5 family)
+### Recommended models (qwen3.5 family, for Ollama)
 
 | Model | Size | Use case |
 |---|---|---|
-| `qwen3.5:4b` | 3.4 GB | Roles with ≤8 tools (navigator, research) |
-| `qwen3.5:cloud` | 6.6 GB | Default — good balance |
+| `qwen3.5:cloud` | - | Default — good balance |
+| `qwen3.5:35b` | 24 GB | Complex multi-step tasks |
 | `qwen3.5:27b` | 17 GB | Complex multi-step tasks |
-| `qwen3-coder-next:cloud` | ~52 GB | Developer role, best code quality |
+| `qwen3.5:9b` | 6.6 GB | Roles with ≤8 tools (navigator, research) |
+| `qwen3-coder:30b` | 19 Gb | Complex multi-step coding |
+| `qwen3-coder-next:cloud` | - | Developer role, best code quality |
 
-### Per-role model routing
+### Per-action-type model routing
 
 ```toml
-model = "qwen3.5:cloud"   # fallback for all roles
+model = "qwen3.5:cloud"   # fallback for all action types
 
 [models]
 coding    = "qwen3-coder-next:cloud"   # used for write_file, str_replace
-search    = "qwen3.5:4b"        # used for read_file, find_files, etc.
-execution = "qwen3.5:4b"        # used for run_command
+search    = "qwen3.5:9b"               # used for read_file, find_files, etc.
+execution = "qwen3.5:9b"               # used for run_command
+vision    = "qwen3.5:cloud"            # used for image tasks
 ```
 
-### Remote Ollama
+### LLM backends
+
+Three wire protocols are supported. Set `llm_backend` in `config.toml` or via `do_it init`:
+
+| Backend | `llm_backend` value | Auth |
+|---|---|---|
+| Ollama | `ollama` | none (local) |
+| OpenAI / compatible | `openai` | `llm_api_key` or `LLM_API_KEY` env |
+| Anthropic / compatible | `anthropic` | `llm_api_key` or `LLM_API_KEY` env |
+
+Any service that implements the OpenAI `/v1/chat/completions` or Anthropic `/v1/messages` API works, including self-hosted proxies and third-party providers. The `llm_url` field sets the base URL — the protocol suffix (`/v1/chat/completions` etc.) is added automatically.
 
 ```toml
-ollama_base_url = "http://192.168.1.100:11434"
+# OpenAI-compatible local proxy, no key needed
+llm_backend = "openai"
+llm_url     = "http://localhost:20128/v1"
+model       = "my-local-model"
 ```
 
 ---
 
 ## Sub-agent Architecture
 
-`spawn_agent` lets the `boss` role delegate subtasks to specialised sub-agents. Each sub-agent runs in-process with its own history, role prompt, and tool allowlist. Communication between boss and sub-agents goes through the shared `.ai/knowledge/` memory.
+`spawn_agent` lets the `boss` role delegate subtasks to specialised sub-agents. Each sub-agent runs in-process with its own history, role prompt, fresh in-memory working memory, and tool allowlist. Communication between boss and sub-agents goes through the shared `.ai/knowledge/` memory.
+
+Design rule:
+- top-level agent: may restore persisted `TaskState`
+- sub-agent: never restores persisted `TaskState`; always starts clean for the current delegated scope
 
 ### Usage
 
@@ -702,7 +926,7 @@ ollama_base_url = "http://192.168.1.100:11434"
   "tool": "spawn_agent",
   "args": {
     "role": "research",
-    "task": "Find the best OAuth2 crates for Axum in 2024",
+    "task": "Find the best OAuth2 crates for Axum in 2026",
     "memory_key": "knowledge/oauth_research",
     "max_steps": 15
   }
@@ -779,7 +1003,9 @@ The agent maintains persistent state in `.ai/` at the repository root. This dire
 │   ├── session_counter.txt
 │   └── external_messages.md  ← external inbox, read and cleared on startup
 ├── logs/
-│   └── history.md
+│   ├── history.md
+│   ├── session-NNN.md         ← per-session markdown report, including path-sensitivity summary when relevant
+│   └── session-NNN.trace.json ← structured session trace (start, turns, finish, path-sensitivity diagnostics)
 └── knowledge/                 ← agent-written project knowledge
     ├── lessons_learned.md     ← QA appends project-specific patterns after each session
     ├── decisions.md           ← Boss/Developer log architectural decisions + rationale
@@ -789,6 +1015,18 @@ The agent maintains persistent state in `.ai/` at the repository root. This dire
 ### What each file is for
 
 **`last_session.md`** — the agent writes a note to its future self at the end of every session: what was done, what is pending, any important context. Read automatically on next startup.
+
+**`session-NNN.md`** — per-session markdown report written under `.ai/logs/`. It includes task, summary, tool usage, and a `Path sensitivity` section when the session touched config, prompts, repo metadata, or other tagged path categories.
+
+**`session-NNN.trace.json`** — structured session trace written under `.ai/logs/`. Besides start/turn/finish events and per-tool call counts, it now records aggregated `path_sensitivity_stats` and embeds per-turn sensitivity hints when tool outputs include `[sensitivity: ...]`.
+
+**Final session summary** — the plain-text close-out printed at the end of a run now includes a compact `Safety : ...` line when path-sensitive writes occurred, so the operator sees the same signal immediately without opening saved artifacts.
+
+**Redaction** — before any text is written to `session-NNN.md`, `session-NNN.trace.json`, or `last_session.md`, the task description and final summary pass through a central redaction filter (`src/redaction.rs`). The filter replaces any line that contains a known sensitive token pattern with `[redacted]`. The same filter is applied to the output strings of all write-oriented tools (`write_file`, `str_replace`, `str_replace_multi`, `str_replace_fuzzy`, `memory_write`, `memory_delete`) before they are returned to the agent. Path-sensitivity annotations such as `[sensitivity: project_config]` are intentionally preserved — they do not match any sensitive-token pattern.
+
+Covered patterns: PEM key headers (`-----BEGIN `), common API key prefixes (`sk-`, `ghp_`, `ghs_`, `glpat-`, `xoxb-`, `xoxp-`), HTTP auth headers (`Authorization: Bearer `, `Authorization: Basic `), and common env-var-style assignments (`password=`, `passwd=`, `secret=`, `api_key=`, `apikey=`, `access_token=`, `refresh_token=`, `private_key=`).
+
+Intentionally not redacted: read-tool output (the agent needs file and memory content to act), subprocess stdout/stderr from `run_command` and git tools (compiler errors, test output), and HTTP response bodies from `fetch_url` / `github_api`. These are ephemeral in the LLM context window and not persisted to on-disk artifacts by the agent runtime.
 
 **`external_messages.md`** — your inbox for the agent. Write anything here before a run; the agent will see it on startup and the file is cleared. Use this for instructions that don't fit as a `--task` flag, or to send notes from an external process.
 
@@ -825,17 +1063,36 @@ Both files are created with commented templates on first run. They are only inje
 
 **`run_command`** — no `|`, `&&`, `>`. Each command is a separate call with an explicit args array.
 
+Current policy hardening:
+- `program` must be a bare executable name from `PATH`, not `./tool` or `C:\path\tool.exe`
+- timeout is required to stay within the tool's max bound
+- arg count / arg length are capped
+- env var count / value length are capped
+- risky env overrides such as `PATH`, `PATHEXT`, `COMSPEC`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `RUSTC_WRAPPER`, `CARGO_HOME`, `RUSTUP_HOME`, `HOME`, and `USERPROFILE` are rejected
+
+**`run_targeted_test`** — currently optimized for Rust repositories. Node/Python fallback branches are intentionally deferred.
+
+**`format_changed_files_only`** — currently optimized for Rust repositories and relies on `git` + `rustfmt` being available.
+
+**`apply_patch_preview`** — preview-only helper. It intentionally does not edit files; follow with `str_replace` or `write_file` for the real change.
+
+**`run_script`** — intentionally narrow. It is for small parsing/inspection tasks, not general-purpose program execution.
+
 **`fetch_url`** — public URLs only, no authentication, no JavaScript rendering. For GitHub use `raw.githubusercontent.com`.
 
 **`web_search`** — DuckDuckGo HTML endpoint, no API key required. Rate limiting possible under heavy use.
 
-**Code intelligence** — regex-based, covers ~95% of real-world cases. Does not handle macros, conditional compilation, or dynamically generated code.
+**Code intelligence** — tree-sitter backend covers ~95% of real-world cases. Does not handle macros, conditional compilation, or dynamically generated code.
 
-**`test_coverage`** — requires `cargo-tarpaulin` for Rust coverage numbers. Install with `cargo install cargo-tarpaulin`. Falls back to `cargo test` without coverage % if not installed.
+**`test_coverage`** — implemented for Rust projects. Coverage numbers depend on `cargo llvm-cov` or `cargo tarpaulin`; without those tools it falls back to `cargo test` and reports that coverage is unavailable.
 
-**Vision** — qwen3.5 supports images, but current GGUF files in Ollama may not include the mmproj component. Use llama.cpp directly for guaranteed vision support.
+**Vision** — image input is implemented and tested. GGUF files in Ollama may not include the mmproj component for vision models. Use llama.cpp directly or verify your model has vision support.
 
-**`spawn_agent`** — sub-agents run sequentially by default. Use `spawn_agents` for parallel execution.
+**`spawn_agent` / `spawn_agents`** — implemented and tested. The main practical limit is step budget and model quality, not a stubbed runtime.
+
+**`memory_write`** — supports `append=true` and namespaced keys (`knowledge/decisions`, `knowledge/qa_report`, etc.) via subdirectory layout in `.ai/memory/`.
+
+**`memory_delete`** — removes a memory entry by key. Available to `boss` and `memory` roles.
 
 ---
 
@@ -854,8 +1111,8 @@ do_it run --task "Plan the auth module refactor"          --role boss
 ### Before running
 
 ```bash
-git status           # start from a clean working tree
-ollama list          # verify required models are available
+git status              # start from a clean working tree
+do_it config            # verify resolved config — check llm_url, llm_backend, model
 ```
 
 ### Write a good task description
@@ -904,17 +1161,25 @@ The agent can list issues, read them, post comments, create PRs, and read file c
 
 **`Tool 'X' is not allowed for role 'Y'`** — the model tried to use a tool outside the role's allowlist. Either switch to `--role default` or add the tool to `.ai/prompts/<role>.md` with an explicit mention.
 
-**`Cannot reach Ollama at http://localhost:11434`**
+**`Cannot reach LLM service`** — check that `llm_url` is correct and the service is running:
 ```bash
+# Ollama
 ollama serve
 curl http://localhost:11434/api/tags
+
+# OpenAI-compatible — check the URL and port
+curl http://localhost:20128/v1/models
 ```
 
-**`Model 'X' not found`**
+**`Model 'X' not found`** (Ollama only)
 ```bash
 ollama pull qwen3.5:cloud
 ollama list
 ```
+
+**`HTTP 401 Unauthorized`** — API key missing or wrong. Set `llm_api_key` in `config.toml` or the `LLM_API_KEY` environment variable.
+
+**`HTTP 404` on chat endpoint** — `llm_url` may include an extra path. Use the base URL only — the protocol suffix (`/v1/chat/completions` for OpenAI, `/api/chat` for Ollama, `/v1/messages` for Anthropic) is appended automatically. For example use `https://api.openai.com`, not `https://api.openai.com/v1`.
 
 **`LLM response has no JSON`** — the model responded outside of JSON format. Try a larger model, set `temperature = 0.0`, or use a role to reduce the tool count.
 
@@ -929,9 +1194,19 @@ ollama list
 
 **`github_api: no token found`** — set `GITHUB_TOKEN` environment variable or pass `"token"` in args.
 
-**`test_coverage: cargo tarpaulin not found`** — install with `cargo install cargo-tarpaulin`. The tool falls back to `cargo test` without coverage numbers.
+**`test_coverage: coverage backend not found`** — install `cargo-llvm-cov` or `cargo-tarpaulin`. Without them, the tool falls back to `cargo test` and reports that coverage numbers are unavailable.
 
-**Agent is looping** — the built-in loop detector will notify you via Telegram. You can also reduce `history_window` to 4, restart with a more specific task, or use a larger model.
+**`run_script` failed or timed out** — reduce the script size, avoid heavy loops, and keep it to parsing/transform tasks. For broader automation, prefer a dedicated Rust tool or `run_command`.
+
+**`run_command` rejects a program or env override** — this is usually intentional policy enforcement, not a runtime bug. Use a bare executable name from `PATH`, keep `timeout_secs` modest, and avoid overriding blocked environment keys.
+
+**`run_targeted_test` only reports Rust support** — this is expected right now. The helper is intentionally Rust-first; Node/Python fallbacks are tracked as later follow-up work.
+
+**`format_changed_files_only` finds nothing to do** — it only formats changed `.rs` files visible to `git status`. If the repo is not a git repo or only non-Rust files changed, the no-op result is expected.
+
+**`apply_patch_preview` says `old_str` is missing or not unique** — this mirrors `str_replace` rules on purpose, so the preview stays honest about whether the eventual targeted edit is safe.
+
+**Agent is looping** — the runtime now injects `Working Memory` and `Strategy Notes` to reduce repeated weak-tool calls, but loops are still possible. Reduce `history_window`, restart with a more specific task, or use a larger model if needed.
 
 **Sub-agent stuck** — if `spawn_agent` takes too long, the sub-agent is limited by `max_steps`. Pass a smaller `max_steps` explicitly, or break the task into smaller pieces.
 
@@ -941,7 +1216,7 @@ ollama list
 
 ```
 do_it/
-├── Cargo.toml           name="do_it", edition="2024", version="0.3.0"
+├── Cargo.toml           name="do_it", edition="2021", version="0.3.2"
 ├── config.toml          runtime configuration (models, Telegram, [browser])
 ├── README.md            project overview
 ├── DOCS.md              this file
@@ -955,15 +1230,47 @@ do_it/
 │   ├── screenshots/     browser tool output (PNG files)
 │   └── knowledge/       lessons_learned, decisions, qa_report, review_report, sub-agent results
 └── src/
-    ├── main.rs          CLI: run | config | roles; --role flag; image detection
-    ├── agent.rs         main loop, session_init (user_profile + boss_notes injection), loop detection
-    ├── config.rs        AgentConfig, BrowserConfig, Role enum + allowlists, ModelRouter, global helpers
-    ├── history.rs       sliding window context manager
-    ├── shell.rs         Ollama HTTP client: chat, chat_with_image, check_models
-    ├── tools.rs         all tools including browser stubs and self-improvement tools
-    └── prompts/         built-in role prompts compiled into the binary via include_str!
+    ├── main.rs              bin wrapper — calls start::run()
+    ├── start.rs             CLI: run | config | roles; --role flag; image detection
+    ├── lib.rs               library root for integration tests
+    ├── agent/               agent module (replaces agent_core/loop/tools)
+    │   ├── mod.rs           pub use core::{SweAgent, StepOutcome}
+    │   ├── core.rs          SweAgent struct and all field accessors
+    │   ├── tools.rs         parse_action, first_line, format_args_display, project detection
+    │   ├── session.rs       session_init/finish, task_state persistence, resume logic
+    │   ├── prompt.rs        build_prompt, build_strategy_notes, detect_loop
+    │   ├── display.rs       console/TUI output helpers, boss task-source enforcement
+    │   ├── spawn.rs         spawn_agent, spawn_agents, TUI sender bridge
+    │   └── loops         
+    │       ├── mod.rs       run(), run_capture(), step(), loop entry points
+    │       └── tests.rs     loops tests
+    ├── config_struct.rs     AgentConfig, BrowserConfig, Role enum, model router, built-in prompts
+    ├── config_loader.rs     config loading, global config bootstrap, prompt overrides
+    ├── config_validation.rs runtime and static config validation
+    ├── history.rs           sliding window context manager
+    ├── task_state.rs        structured working memory for goal/actions/artifacts/blockers
+    ├── redaction.rs         central redaction filter — scrubs sensitive tokens from artifact strings
+    ├── shell.rs             LLM client: Ollama / OpenAI / Anthropic backends, BackendConfig, LlmClient
+    ├── tui.rs               Ratatui TUI: three-panel live view, prompt widget, panic hook
+    ├── validation.rs        path traversal protection and safe path resolution
+    ├── tools/               runtime tools split by domain
+    │   ├── core.rs          central dispatch (dispatch_with_depth) and shared helpers
+    │   ├── spec.rs          tool registry: names, aliases, roles, status, prompt metadata
+    │   ├── file_ops.rs      read_file, write_file, str_replace, apply_patch_preview, list_dir, find_files, search_in_files
+    │   ├── commands.rs      run_command, run_targeted_test, format_changed_files_only
+    │   ├── web.rs           web_search, fetch_url, github_api
+    │   ├── human.rs         ask_human (TUI + Telegram), notify
+    │   ├── memory.rs        memory_read, memory_write, memory_delete (namespaced keys)
+    │   ├── code_analysis.rs get_symbols, outline, get_signature, find_references
+    │   ├── git.rs           git_status, git_commit, git_log, git_stash, git_pull, git_push
+    │   ├── browser.rs       screenshot, browser_get_text, browser_action, browser_navigate
+    │   ├── workspace.rs     tree, project_map, find_entrypoints, trace_call_path, diff_repo
+    │   ├── background.rs    run_background, process_status, process_list, process_kill
+    │   ├── scripting.rs     run_script (Rhai sandbox)
+    │   └── test_coverage.rs test_coverage with cargo llvm-cov / tarpaulin fallback
+    └── prompts/             built-in role prompts compiled into the binary via include_str!
         ├── default.md
-        ├── boss.md      orchestrator with browser eyes and wishlist rules
+        ├── boss.md          orchestrator — memory, spawn, never writes code directly
         ├── developer.md
         ├── navigator.md
         ├── qa.md
