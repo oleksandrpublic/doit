@@ -346,7 +346,7 @@ do_it roles   # print all roles and their allowlists
 | `navigator` | Explore codebase — read-only | `read_file`, `list_dir`, `find_files`, `search_in_files`, `tree`, `get_symbols`, `outline`, `find_references`, `project_map`, `trace_call_path`, `memory` |
 | `qa` | Testing and verification | `read_file`, `search_in_files`, `run_command`, `run_script`, `diff_repo`, `read_test_failure`, `test_coverage`, `git_*`, `memory`, `notify` |
 | `reviewer` | Static code review — no execution | `read_file`, `search_in_files`, `diff_repo`, `git_log`, `get_symbols`, `outline`, `get_signature`, `find_references`, `ask_human`, `memory` |
-| `memory` | Managing `.ai/` state | `memory_read`, `memory_write` |
+| `memory` | Managing `.ai/` state | `memory_read`, `memory_write`, `memory_delete` |
 
 ### System prompt priority
 
@@ -522,6 +522,7 @@ Current state: Rust projects are supported. The tool prefers `cargo llvm-cov`, f
 |---|---|---|
 | `memory_read` | `key` | Read a memory entry |
 | `memory_write` | `key`, `content`, `append?` | Write or append to a memory entry |
+| `memory_delete` | `key` | Delete a memory entry |
 
 **Logical key mapping:**
 
@@ -620,6 +621,8 @@ Sends a one-way message with no waiting. Used for progress updates and completio
 
 ```json
 { "tool": "notify", "args": { "message": "OAuth implementation complete, running tests..." } }
+```
+```json
 { "tool": "notify", "args": { "message": "All tests pass. PR created.", "silent": true } }
 ```
 
@@ -673,7 +676,7 @@ docker run -d --name lightpanda -p 9222:9222 lightpanda/browser:nightly
 
 ### Planned browser direction
 
-The intended direction is a config-driven CDP/browser backend with cleaner “browser not configured” messages. The current implementation is a simpler direct `headless_chrome` integration, so treat the rest of this section as the target architecture rather than a fully completed contract.
+The intended direction is a config-driven CDP/browser backend with cleaner "browser not configured" messages. The current implementation is a simpler direct `headless_chrome` integration, so treat the rest of this section as the target architecture rather than a fully completed contract.
 
 ### How the agent uses browser tools
 
@@ -766,11 +769,9 @@ Each entry is timestamped and structured. The wishlist is your primary source fo
 ```
 session_init():
   → increment .ai/state/session_counter.txt
-  → read last_session.md              → inject into history as step 0
-  → read user_profile.md (Boss only)  → inject into history (global preferences)
-  → read boss_notes.md   (Boss only)  → inject into history (cross-project insights)
-  → read external_messages.md         → inject into history, then clear the file
-  → read/scaffold .ai/project.toml   → inject into history as project context
+  → read last_session.md   → inject into history as step 0
+  → restore task_state.json from disk (if resume-worthy)
+  → cache boss_notes.md and user_profile.md for prompt use
 ```
 
 On first run in a new repository, `.ai/project.toml` is scaffolded automatically by detecting `Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` and reading the GitHub remote from `.git/config`. Edit it freely — it will not be overwritten.
@@ -1001,6 +1002,7 @@ The agent maintains persistent state in `.ai/` at the repository root. This dire
 │   ├── current_plan.md        ← boss writes the task plan here
 │   ├── last_session.md        ← read on startup, written at end of session
 │   ├── session_counter.txt
+│   ├── task_state.json        ← structured working memory, survives interruption
 │   └── external_messages.md  ← external inbox, read and cleared on startup
 ├── logs/
 │   ├── history.md
@@ -1015,6 +1017,8 @@ The agent maintains persistent state in `.ai/` at the repository root. This dire
 ### What each file is for
 
 **`last_session.md`** — the agent writes a note to its future self at the end of every session: what was done, what is pending, any important context. Read automatically on next startup.
+
+**`task_state.json`** — structured working memory persisted across interruptions. Restored at the start of the next session when it contains a resume-worthy goal or action history. Cleared on successful completion, kept on error or no-progress stop.
 
 **`session-NNN.md`** — per-session markdown report written under `.ai/logs/`. It includes task, summary, tool usage, and a `Path sensitivity` section when the session touched config, prompts, repo metadata, or other tagged path categories.
 
@@ -1225,7 +1229,7 @@ do_it/
 ├── .ai/                 agent memory (created automatically, gitignored)
 │   ├── project.toml     project config (auto-scaffolded)
 │   ├── prompts/         custom role prompts
-│   ├── state/           plan, last_session, session_counter, external_messages
+│   ├── state/           plan, last_session, session_counter, task_state, external_messages
 │   ├── logs/            history.md
 │   ├── screenshots/     browser tool output (PNG files)
 │   └── knowledge/       lessons_learned, decisions, qa_report, review_report, sub-agent results
@@ -1249,6 +1253,7 @@ do_it/
     ├── config_validation.rs runtime and static config validation
     ├── history.rs           sliding window context manager
     ├── task_state.rs        structured working memory for goal/actions/artifacts/blockers
+    ├── loop_policy.rs       loop/stall detection thresholds and signal functions
     ├── redaction.rs         central redaction filter — scrubs sensitive tokens from artifact strings
     ├── shell.rs             LLM client: Ollama / OpenAI / Anthropic backends, BackendConfig, LlmClient
     ├── tui.rs               Ratatui TUI: three-panel live view, prompt widget, panic hook

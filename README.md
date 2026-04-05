@@ -158,10 +158,10 @@ When running in an interactive terminal, do_it shows a three-panel live view:
 │  do_it   task: "Add OAuth2 login"   role: boss   0:03:21    │
 ├──────────────────────┬──────────────────────────────────────┤
 │  PROGRESS            │  STEP LOG                            │
-│  Step:  7 / 50  ████ │  step 1  ✓  project_map  → found    │
-│  Role:  boss         │  step 2  ✓  spawn_agents → started  │
-│  Elapsed: 0:03:21    │  step 3  ✓  memory_read  → loaded   │
-│  ETA:   ~0:08:00     │  step 4  ·  spawn_agent  running... │
+│  Step:  7 / 50  ████ │  step 1  ✓  project_map  → found     │
+│  Role:  boss         │  step 2  ✓  spawn_agents → started   │
+│  Elapsed: 0:03:21    │  step 3  ✓  memory_read  → loaded    │
+│  ETA:   ~0:08:00     │  step 4  ·  spawn_agent  running...  │
 │  Tokens step:        │                                      │
 │    in  2,847 out 312 │                                      │
 │  Tokens total:       │                                      │
