@@ -7,6 +7,7 @@ mod memory;
 mod redaction;
 mod scripting;
 mod session;
+mod spawn;
 mod test_coverage;
 mod web;
 mod workspace;

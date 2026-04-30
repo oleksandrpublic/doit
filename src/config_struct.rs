@@ -77,17 +77,17 @@ impl ModelRole {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BrowserConfig {
+    /// AWP server URL, e.g. "http://127.0.0.1:9222".
+    /// Start with: plasmate serve --protocol awp --host 127.0.0.1 --port 9222
     #[serde(default)]
-    pub cdp_url: Option<String>,
-    #[serde(default)]
-    pub chrome_path: Option<String>,
+    pub awp_url: Option<String>,
     #[serde(default)]
     pub screenshot_dir: Option<String>,
 }
 
 impl BrowserConfig {
     pub fn is_configured(&self) -> bool {
-        self.cdp_url.is_some() || self.chrome_path.is_some()
+        self.awp_url.is_some()
     }
 
     pub fn effective_screenshot_dir(&self, repo_root: &Path) -> std::path::PathBuf {
@@ -274,7 +274,7 @@ pub struct AgentConfig {
     /// Telegram chat_id to send messages to (optional)
     #[serde(default)]
     pub telegram_chat_id: Option<String>,
-    /// Optional headless browser backend (CDP or local Chrome)
+    /// Optional headless browser backend 
     #[serde(default)]
     pub browser: BrowserConfig,
     /// Log level: "error", "warn", "info", "debug", "trace"

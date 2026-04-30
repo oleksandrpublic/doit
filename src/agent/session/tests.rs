@@ -1,698 +1,8 @@
-use crate::agent::core::{StopReason, SweAgent};
-use crate::agent::loops::SessionArtifacts;
-use crate::config_loader::{global_boss_notes_path, global_user_profile_path};
-use crate::config_struct::{AI_DIR, LOGS_DIR, STATE_DIR};
-use crate::history::Turn;
-use crate::redaction;
-use crate::tools;
-use serde::Serialize;
-use std::path::PathBuf;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TaskStatePersistenceAction {
-    Save,
-    Clear,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionTrace<'a> {
-    schema_version: u32,
-    session_nr: u64,
-    role: &'a str,
-    config_source: &'a str,
-    task: &'a str,
-    stop_reason: &'a str,
-    started_at: &'a str,
-    ended_at: String,
-    max_steps: usize,
-    steps_used: usize,
-    resumed_from_task_state: bool,
-    summary_preview: String,
-    total_calls: usize,
-    ok_calls: usize,
-    err_calls: usize,
-    tool_stats: Vec<SessionTraceToolStat<'a>>,
-    path_sensitivity_stats: Vec<SessionTracePathSensitivityStat<'static>>,
-    events: Vec<SessionTraceEvent<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionTraceToolStat<'a> {
-    tool: &'a str,
-    calls: usize,
-    err_calls: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionTracePathSensitivityStat<'a> {
-    category: &'a str,
-    calls: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionTraceEvent<'a> {
-    event: &'static str,
-    step: Option<usize>,
-    tool: Option<&'a str>,
-    success: Option<bool>,
-    detail: String,
-}
-
-impl SweAgent {
-    pub fn session_finish(
-        &self,
-        task: &str,
-        final_summary: &str,
-        stop_reason: StopReason,
-        steps_used: usize,
-        started_at: std::time::Instant,
-        started_at_str: &str,
-    ) -> Option<SessionArtifacts> {
-        if self.depth() > 0 {
-            return None;
-        }
-        let logs_dir = self.root().join(AI_DIR).join(LOGS_DIR);
-        if std::fs::create_dir_all(&logs_dir).is_err() {
-            return None;
-        }
-        let log_path = logs_dir.join(format!("session-{:03}.md", self.session_nr()));
-        let trace_path = self.session_trace_path();
-        let now = tools::chrono_now();
-        let role = self.role().name();
-        let n = self.session_nr();
-        let turns: Vec<&Turn> = self.history().turns.iter().filter(|t| t.step > 0).collect();
-        let total_calls = turns.len();
-        let ok_calls = turns.iter().filter(|t| t.success).count();
-        let err_calls = total_calls - ok_calls;
-        let mut tool_counts: std::collections::HashMap<&str, (usize, usize)> = Default::default();
-        for t in &turns {
-            let e = tool_counts.entry(t.tool.as_str()).or_insert((0, 0));
-            e.0 += 1;
-            if !t.success {
-                e.1 += 1;
-            }
-        }
-        let mut tool_list: Vec<_> = tool_counts.iter().collect();
-        tool_list.sort_by(|a, b| b.1.0.cmp(&a.1.0));
-        let tools_section: String = tool_list
-            .iter()
-            .map(|(name, (calls, errs))| {
-                if *errs > 0 {
-                    format!("  - {name}: {calls} calls ({errs} errors)")
-                } else {
-                    format!("  - {name}: {calls} calls")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let path_sensitivity_stats = Self::trace_path_sensitivity_stats(&turns);
-        let path_sensitivity_section =
-            Self::render_path_sensitivity_report_section(&path_sensitivity_stats);
-        let status = match stop_reason {
-            StopReason::Success => "✓ success",
-            StopReason::MaxSteps => "✗ stopped: max steps reached",
-            StopReason::NoProgress => "✗ stopped: no progress",
-            StopReason::Error => "✗ failed / incomplete",
-        };
-        // Redact sensitive tokens from task and summary before writing to any artifact.
-        let task_safe = redaction::redact(task);
-        let summary_safe = redaction::redact(final_summary);
-        let report = format!(
-            "# Session #{n} — {date}\n\n**Role:** {role}  \n**Config source:** {config_source}  \n**Status:** {status}  \n**Steps used:** {steps_used}  \n**Tool calls:** {total_calls} ({ok_calls} ok, {err_calls} errors)  \n\n## Task\n\n{task_safe}\n\n## Summary\n\n{summary_safe}\n\n## Tools used\n\n{tools_section}{path_sensitivity_section}\n",
-            date = now,
-            config_source = self.config_source()
-        );
-        let _ = std::fs::write(&log_path, &report);
-        let trace_path = self.write_session_trace(
-            trace_path,
-            &task_safe,
-            &summary_safe,
-            stop_reason,
-            steps_used,
-            started_at_str,
-            total_calls,
-            ok_calls,
-            err_calls,
-            &turns,
-        );
-        if !crate::tui::tui_is_active() {
-            println!("  [session] Report written to {}", log_path.display());
-            if let Some(trace_path) = &trace_path {
-                println!("  [session] Trace written to {}", trace_path.display());
-            }
-        }
-        self.apply_task_state_persistence(stop_reason);
-        self.update_last_session(&summary_safe, &task_safe, n, stop_reason, &turns);
-        Some(SessionArtifacts {
-            log_path,
-            trace_path,
-            total_calls,
-            ok_calls,
-            err_calls,
-            started_at,
-            started_at_str: started_at_str.to_string(),
-        })
-    }
-
-    fn update_last_session(
-        &self,
-        summary: &str,
-        task: &str,
-        n: u64,
-        stop_reason: StopReason,
-        turns: &[&Turn],
-    ) {
-        let state_dir = self.root().join(AI_DIR).join(STATE_DIR);
-        let path = state_dir.join("last_session.md");
-        let now = tools::chrono_now();
-        let status_str = match stop_reason {
-            StopReason::Success => "✓ success",
-            StopReason::MaxSteps => "✗ max steps",
-            StopReason::NoProgress => "✗ no progress",
-            StopReason::Error => "✗ error",
-        };
-        let safety_line = Self::render_path_sensitivity_summary_line(
-            &Self::trace_path_sensitivity_stats(turns),
-        )
-        .map(|line| format!("**Safety:** {line}\n\n"))
-        .unwrap_or_default();
-        let entry = format!(
-            "\n## Session #{n} — {now} {status_str}\n**Task:** {task}\n\n{safety_line}{summary}\n---\n"
-        );
-        let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        let updated = format!("{existing}{entry}");
-        let _ = std::fs::write(&path, &updated);
-        const MAX_LINES: usize = 200;
-        const KEEP_LINES: usize = 150;
-        let line_count = updated.lines().count();
-        if line_count > MAX_LINES {
-            if !crate::tui::tui_is_active() {
-                println!(
-                    "  [memory] last_session.md has {line_count} lines — compressing to {KEEP_LINES}"
-                );
-            }
-            let kept: Vec<&str> = updated
-                .lines()
-                .rev()
-                .take(KEEP_LINES)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            let compressed = format!(
-                "<!-- compressed: older entries removed, keeping last {KEEP_LINES} lines -->\n{}\n",
-                kept.join("\n")
-            );
-            let _ = std::fs::write(&path, compressed);
-        }
-    }
-
-    pub(crate) fn shutdown_tui(&mut self) {
-        if let Some(mut tui) = self.take_tui() {
-            tui.shutdown();
-            crate::tui::set_tui_active(false);
-        }
-    }
-
-    pub(crate) fn print_final_summary(
-        &self,
-        stop_reason: StopReason,
-        summary: &str,
-        steps_used: usize,
-        artifacts: Option<&SessionArtifacts>,
-    ) {
-        for line in self.render_final_summary_lines(stop_reason, summary, steps_used, artifacts) {
-            println!("{line}");
-        }
-    }
-
-    fn final_summary_preview(summary: &str) -> String {
-        let trimmed = summary.trim();
-        if trimmed.is_empty() {
-            return "(empty)".to_string();
-        }
-
-        let first_line = trimmed.lines().next().unwrap_or("").trim();
-        let compact = if first_line.is_empty() {
-            trimmed
-        } else {
-            first_line
-        };
-        let compact = compact.replace('\t', " ");
-
-        if compact.len() > 220 {
-            format!("{}...", &compact[..220])
-        } else {
-            compact
-        }
-    }
-
-    pub fn session_init(&mut self) {
-        let state_dir = self.root().join(AI_DIR).join(STATE_DIR);
-        let counter_path = state_dir.join("session_counter.txt");
-        let last_session_path = state_dir.join("last_session.md");
-        let _ = std::fs::create_dir_all(&state_dir);
-        self.set_resumed_from_task_state(false);
-        let n = std::fs::read_to_string(&counter_path)
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(0)
-            + 1;
-        self.set_session_nr(n);
-        let _ = std::fs::write(&counter_path, n.to_string());
-        if let Ok(content) = std::fs::read_to_string(&last_session_path) {
-            let summary = content.lines().take(30).collect::<Vec<_>>().join("\n");
-            self.history_mut().push(Turn {
-                step: 0,
-                thought: "Loading previous session context".to_string(),
-                tool: "load_session".to_string(),
-                args: serde_json::json!({}),
-                output: summary,
-                success: true,
-            });
-        }
-        self.restore_task_state_from_disk();
-
-        // Cache global files once here — build_prompt reads these every step
-        // which would be N disk reads per session without caching.
-        let boss_notes = global_boss_notes_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        let user_profile = global_user_profile_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        self.set_cached_boss_notes(boss_notes);
-        self.set_cached_user_profile(user_profile);
-    }
-
-    pub(crate) fn task_state_path(&self) -> PathBuf {
-        self.root()
-            .join(AI_DIR)
-            .join(STATE_DIR)
-            .join("task_state.json")
-    }
-
-    fn session_trace_path(&self) -> PathBuf {
-        self.root()
-            .join(AI_DIR)
-            .join(LOGS_DIR)
-            .join(format!("session-{:03}.trace.json", self.session_nr()))
-    }
-
-    pub(crate) fn save_task_state(&self) {
-        let path = self.task_state_path();
-        let _ = std::fs::write(&path, self.task_state().to_json_pretty());
-    }
-
-    fn task_state_persistence_action(&self, stop_reason: StopReason) -> TaskStatePersistenceAction {
-        if self.depth() > 0 || stop_reason.is_success() {
-            TaskStatePersistenceAction::Clear
-        } else {
-            TaskStatePersistenceAction::Save
-        }
-    }
-
-    fn apply_task_state_persistence(&self, stop_reason: StopReason) {
-        match self.task_state_persistence_action(stop_reason) {
-            TaskStatePersistenceAction::Save => self.save_task_state(),
-            TaskStatePersistenceAction::Clear => self.clear_task_state(),
-        }
-    }
-
-    fn clear_task_state(&self) {
-        let path = self.task_state_path();
-        let _ = std::fs::remove_file(&path);
-    }
-
-    fn restore_task_state_from_disk(&mut self) -> bool {
-        let path = self.task_state_path();
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return false;
-        };
-        let Some(state) = crate::task_state::TaskState::from_json(&content) else {
-            return false;
-        };
-        if !state.is_resume_worthy() {
-            return false;
-        }
-        self.task_state_mut().clone_from(&state);
-        self.task_state_mut().clear_session_signals();
-        self.set_resumed_from_task_state(true);
-        self.history_mut().push(Turn {
-            step: 0,
-            thought: "Loading persisted task state".to_string(),
-            tool: "load_task_state".to_string(),
-            args: serde_json::json!({ "path": path.display().to_string() }),
-            output: state.format_for_prompt(),
-            success: true,
-        });
-        true
-    }
-
-    fn write_session_trace(
-        &self,
-        path: PathBuf,
-        task: &str,
-        final_summary: &str,
-        stop_reason: StopReason,
-        steps_used: usize,
-        started_at_str: &str,
-        total_calls: usize,
-        ok_calls: usize,
-        err_calls: usize,
-        turns: &[&Turn],
-    ) -> Option<PathBuf> {
-        let path_sensitivity_stats = Self::trace_path_sensitivity_stats(turns);
-        let trace = SessionTrace {
-            schema_version: 3,
-            session_nr: self.session_nr(),
-            role: self.role().name(),
-            config_source: self.config_source(),
-            task,
-            stop_reason: self.stop_reason_label(stop_reason),
-            started_at: started_at_str,
-            ended_at: tools::chrono_now(),
-            max_steps: self.max_steps(),
-            steps_used,
-            resumed_from_task_state: self.resumed_from_task_state(),
-            summary_preview: Self::trace_preview(&Self::final_summary_preview(final_summary), 220),
-            total_calls,
-            ok_calls,
-            err_calls,
-            tool_stats: Self::trace_tool_stats(turns),
-            path_sensitivity_stats,
-            events: self.trace_events(task, stop_reason, turns),
-        };
-
-        let json = serde_json::to_string_pretty(&trace).ok()?;
-        std::fs::write(&path, json).ok()?;
-        Some(path)
-    }
-
-    fn trace_events<'a>(
-        &'a self,
-        task: &'a str,
-        stop_reason: StopReason,
-        turns: &[&'a Turn],
-    ) -> Vec<SessionTraceEvent<'a>> {
-        let mut events = Vec::with_capacity(turns.len() + 2);
-        events.push(SessionTraceEvent {
-            event: "session_started",
-            step: None,
-            tool: None,
-            success: None,
-            detail: Self::trace_preview(task, 160),
-        });
-
-        for turn in turns {
-            let sensitivity_note = Self::trace_turn_sensitivity(turn)
-                .map(|sensitivity| format!(" sensitivity={sensitivity}"))
-                .unwrap_or_default();
-            events.push(SessionTraceEvent {
-                event: "turn",
-                step: Some(turn.step),
-                tool: Some(turn.tool.as_str()),
-                success: Some(turn.success),
-                detail: format!(
-                    "thought={}{} output={}",
-                    Self::trace_preview(&turn.thought, 120),
-                    sensitivity_note,
-                    Self::trace_preview(&turn.output, 160)
-                ),
-            });
-        }
-
-        events.push(SessionTraceEvent {
-            event: "session_finished",
-            step: turns.last().map(|turn| turn.step),
-            tool: None,
-            success: Some(stop_reason.is_success()),
-            detail: format!(
-                "stop_reason={} final_output={}",
-                self.stop_reason_label(stop_reason),
-                Self::trace_preview(
-                    turns
-                        .last()
-                        .map(|turn| turn.output.as_str())
-                        .unwrap_or_default(),
-                    160
-                )
-            ),
-        });
-        events
-    }
-
-    fn trace_tool_stats<'a>(turns: &[&'a Turn]) -> Vec<SessionTraceToolStat<'a>> {
-        let mut tool_counts: std::collections::HashMap<&str, (usize, usize)> = Default::default();
-        for turn in turns {
-            let entry = tool_counts.entry(turn.tool.as_str()).or_insert((0, 0));
-            entry.0 += 1;
-            if !turn.success {
-                entry.1 += 1;
-            }
-        }
-
-        let mut tool_list: Vec<_> = tool_counts
-            .into_iter()
-            .map(|(tool, (calls, err_calls))| SessionTraceToolStat {
-                tool,
-                calls,
-                err_calls,
-            })
-            .collect();
-        tool_list.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.tool.cmp(b.tool)));
-        tool_list
-    }
-
-    fn trace_path_sensitivity_stats(
-        turns: &[&Turn],
-    ) -> Vec<SessionTracePathSensitivityStat<'static>> {
-        let mut counts: std::collections::HashMap<&'static str, usize> = Default::default();
-        for turn in turns {
-            if let Some(category) = Self::trace_turn_sensitivity(turn) {
-                *counts.entry(category).or_insert(0) += 1;
-            }
-        }
-
-        let mut stats: Vec<_> = counts
-            .into_iter()
-            .map(|(category, calls)| SessionTracePathSensitivityStat { category, calls })
-            .collect();
-        stats.sort_by(|a, b| {
-            b.calls
-                .cmp(&a.calls)
-                .then_with(|| a.category.cmp(b.category))
-        });
-        stats
-    }
-
-    fn render_path_sensitivity_report_section(
-        stats: &[SessionTracePathSensitivityStat<'static>],
-    ) -> String {
-        if stats.is_empty() {
-            return String::new();
-        }
-
-        let body = stats
-            .iter()
-            .map(|stat| format!("  - {}: {} call(s)", stat.category, stat.calls))
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("\n\n## Path sensitivity\n\n{body}")
-    }
-
-    fn render_final_summary_lines(
-        &self,
-        stop_reason: StopReason,
-        summary: &str,
-        steps_used: usize,
-        artifacts: Option<&SessionArtifacts>,
-    ) -> Vec<String> {
-        let mut lines = vec![
-            String::new(),
-            format!(
-                "Result : {}",
-                match stop_reason {
-                    StopReason::Success => "success",
-                    StopReason::MaxSteps => "stopped: max steps reached",
-                    StopReason::NoProgress => "stopped: no progress",
-                    StopReason::Error => "failed / incomplete",
-                }
-            ),
-            format!("Steps  : {steps_used}/{}", self.max_steps()),
-        ];
-
-        if let Some(artifacts) = artifacts {
-            let elapsed = artifacts.started_at.elapsed();
-            let duration_str = if elapsed.as_secs() >= 3600 {
-                format!(
-                    "{}h {:02}m {:02}s",
-                    elapsed.as_secs() / 3600,
-                    (elapsed.as_secs() % 3600) / 60,
-                    elapsed.as_secs() % 60
-                )
-            } else if elapsed.as_secs() >= 60 {
-                format!("{}m {:02}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
-            } else {
-                format!("{}s", elapsed.as_secs())
-            };
-            lines.push(format!("Started: {}", artifacts.started_at_str));
-            lines.push(format!("Ended  : {}", tools::chrono_now()));
-            lines.push(format!("Time   : {duration_str}"));
-            lines.push(format!(
-                "Calls  : {} total ({} ok, {} errors)",
-                artifacts.total_calls, artifacts.ok_calls, artifacts.err_calls
-            ));
-            let sensitivity_summary =
-                Self::render_path_sensitivity_summary_line(&Self::trace_path_sensitivity_stats(
-                    &self
-                        .history()
-                        .turns
-                        .iter()
-                        .filter(|t| t.step > 0)
-                        .collect::<Vec<_>>(),
-                ));
-            if let Some(sensitivity_summary) = sensitivity_summary {
-                lines.push(format!("Safety : {sensitivity_summary}"));
-            }
-            lines.push(format!("Config : {}", self.config_source()));
-            lines.push(format!("Report : {}", artifacts.log_path.display()));
-            if let Some(trace_path) = &artifacts.trace_path {
-                lines.push(format!("Trace  : {}", trace_path.display()));
-            }
-        }
-        lines.push(format!("Summary: {}", Self::final_summary_preview(summary)));
-        lines
-    }
-
-    fn render_path_sensitivity_summary_line(
-        stats: &[SessionTracePathSensitivityStat<'static>],
-    ) -> Option<String> {
-        if stats.is_empty() {
-            return None;
-        }
-
-        let summary = stats
-            .iter()
-            .take(3)
-            .map(|stat| format!("{}={}", stat.category, stat.calls))
-            .collect::<Vec<_>>()
-            .join(", ");
-        if stats.len() > 3 {
-            Some(format!("{summary} (+{} more)", stats.len() - 3))
-        } else {
-            Some(summary)
-        }
-    }
-
-    fn trace_turn_sensitivity(turn: &Turn) -> Option<&'static str> {
-        const PREFIX: &str = "[sensitivity: ";
-        let start = turn.output.find(PREFIX)? + PREFIX.len();
-        let rest = &turn.output[start..];
-        let end = rest.find(']')?;
-        let category = &rest[..end];
-
-        match category {
-            "outside_workspace" => Some("outside_workspace"),
-            "repo_meta" => Some("repo_meta"),
-            "project_config" => Some("project_config"),
-            "runtime_state" => Some("runtime_state"),
-            "prompts" => Some("prompts"),
-            "knowledge" => Some("knowledge"),
-            "memory" => Some("memory"),
-            "source" => Some("source"),
-            _ => None,
-        }
-    }
-
-    fn stop_reason_label(&self, stop_reason: StopReason) -> &'static str {
-        match stop_reason {
-            StopReason::Success => "success",
-            StopReason::MaxSteps => "max_steps",
-            StopReason::NoProgress => "no_progress",
-            StopReason::Error => "error",
-        }
-    }
-
-    fn trace_preview(text: &str, max: usize) -> String {
-        if text.trim().is_empty() {
-            return "(empty)".to_string();
-        }
-        let redacted = redaction::redact(text);
-        let single_line = redacted.replace('\n', "\\n").replace('\r', "");
-        let trimmed = single_line.trim();
-        let mut chars = trimmed.chars();
-        let collected: String = chars.by_ref().take(max).collect();
-        if chars.next().is_some() {
-            format!("{collected}...")
-        } else if collected.is_empty() {
-            "(empty)".to_string()
-        } else {
-            collected
-        }
-    }
-
-    pub(crate) fn resume_effective_task(&self, requested_task: &str) -> String {
-        if requested_task.trim().eq_ignore_ascii_case("continue") {
-            if let Some(goal) = self.task_state().goal() {
-                return format!("Continue the interrupted task: {goal}");
-            }
-        }
-        requested_task.to_string()
-    }
-
-    pub(crate) fn resume_guidance(&self) -> Option<String> {
-        if !self.resumed_from_task_state() {
-            return None;
-        }
-
-        let mut lines = Vec::new();
-        if let Some(goal) = self.task_state().goal() {
-            lines.push(format!("- Restored goal from persisted task state: {goal}"));
-        }
-        if let Some(next) = self.task_state().next_best_action_hint() {
-            lines.push(format!("- Last known next best action: {next}"));
-        }
-        if let Some(safety) = self.recent_resume_safety_summary() {
-            lines.push(format!(
-                "- Recent path-sensitive writes from the previous session: {safety}. Verify those areas before broad follow-up changes."
-            ));
-        }
-        if self.task_state().has_recent_stall_pressure() {
-            lines.push("- The saved state shows exploration-heavy churn without recent implementation or verification progress; resume with a concrete implementation, verification, clarification, or blocker-reporting step.".to_string());
-        } else if self.task_state().strategy_change_required() {
-            lines.push("- The saved state already required a strategy change; do not resume with another exploration-only step.".to_string());
-        }
-
-        if lines.is_empty() {
-            None
-        } else {
-            Some(lines.join("\n"))
-        }
-    }
-
-    fn recent_resume_safety_summary(&self) -> Option<String> {
-        self.history()
-            .turns
-            .iter()
-            .rev()
-            .find(|turn| turn.tool == "load_session" && turn.success)
-            .and_then(|turn| {
-                turn.output.lines().find_map(|line| {
-                    line.trim()
-                        .strip_prefix("**Safety:** ")
-                        .map(str::trim)
-                        .filter(|summary| !summary.is_empty())
-                        .map(ToOwned::to_owned)
-                })
-            })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{SessionTracePathSensitivityStat, SweAgent, TaskStatePersistenceAction};
-    use crate::agent::core::StopReason;
+    use crate::agent::core::{StopReason, SweAgent};
+    use crate::agent::session::persistence::TaskStatePersistenceAction;
+    use crate::agent::session::trace::SessionTracePathSensitivityStat;
     use crate::config_struct::{AgentConfig, Role};
     use crate::history::Turn;
 
@@ -727,6 +37,62 @@ mod tests {
         assert_eq!(
             agent.task_state_persistence_action(StopReason::MaxSteps),
             TaskStatePersistenceAction::Save
+        );
+    }
+
+    #[test]
+    fn append_decision_writes_structured_entry() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.session_init();
+
+        agent.append_decision(3, "read_file", "Using read_file instead of outline because I need the full body");
+
+        let decisions_path = repo.path()
+            .join(".ai").join("state").join("session_decisions.md");
+        assert!(decisions_path.exists(), "session_decisions.md must be created");
+
+        let content = std::fs::read_to_string(&decisions_path).unwrap();
+        assert!(content.contains("Step 3"), "entry must include step number");
+        assert!(content.contains("[developer]"), "entry must include role");
+        assert!(content.contains("Tool: read_file"), "entry must include tool");
+        assert!(
+            content.contains("Using read_file instead of outline"),
+            "entry must include decision text"
+        );
+    }
+
+    #[test]
+    fn append_decision_accumulates_multiple_entries() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.session_init();
+
+        agent.append_decision(1, "outline", "outline first to get symbol locations");
+        agent.append_decision(2, "str_replace", "str_replace preferred over write_file for targeted edit");
+
+        let content = std::fs::read_to_string(
+            repo.path().join(".ai").join("state").join("session_decisions.md"),
+        ).unwrap();
+        assert!(content.contains("Step 1"), "first entry must be present");
+        assert!(content.contains("Step 2"), "second entry must be present");
+        assert!(content.contains("outline first"), "first decision text must be present");
+        assert!(content.contains("str_replace preferred"), "second decision text must be present");
+    }
+
+    #[test]
+    fn append_decision_ignores_empty_decision() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.session_init();
+
+        agent.append_decision(1, "read_file", "   ");
+
+        let decisions_path = repo.path()
+            .join(".ai").join("state").join("session_decisions.md");
+        assert!(
+            !decisions_path.exists() || std::fs::read_to_string(&decisions_path).unwrap().trim().is_empty(),
+            "empty decision must not create a non-empty file"
         );
     }
 
@@ -879,7 +245,7 @@ mod tests {
         assert!(trace_path.exists());
 
         let trace = std::fs::read_to_string(trace_path).unwrap();
-        assert!(trace.contains("\"schema_version\": 3"));
+        assert!(trace.contains("\"schema_version\": 4"));
         assert!(trace.contains("\"max_steps\": 5"));
         assert!(trace.contains("\"config_source\": \"built-in defaults\""));
         assert!(trace.contains("\"path_sensitivity_stats\""));
@@ -1010,6 +376,12 @@ mod tests {
                 .detail
                 .contains("output=llm_backend = \"ollama\"\\nmodel = \"qwen\"")
         );
+        assert!(
+            events[1].args_preview.contains("config.toml"),
+            "turn args_preview must contain the path argument: {}", events[1].args_preview
+        );
+        assert!(events[0].args_preview.is_empty(), "session_started args_preview must be empty");
+        assert!(events[2].args_preview.is_empty(), "session_finished args_preview must be empty");
         assert_eq!(events[2].event, "session_finished");
         assert_eq!(events[2].success, Some(false));
         assert!(events[2].detail.contains("stop_reason=no_progress"));
@@ -1328,7 +700,7 @@ mod tests {
         let trace: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(trace_path).unwrap()).unwrap();
 
-        assert_eq!(trace["schema_version"], 3);
+        assert_eq!(trace["schema_version"], 4);
         assert_eq!(trace["role"], "developer");
         assert_eq!(trace["config_source"], "built-in defaults");
         assert_eq!(trace["stop_reason"], "error");
@@ -1354,6 +726,18 @@ mod tests {
         assert_eq!(
             trace["events"][1]["detail"],
             "thought=Inspect config sensitivity=project_config output=ok [sensitivity: project_config]"
+        );
+        assert!(
+            trace["events"][1]["args_preview"].as_str().unwrap().contains("config.toml"),
+            "turn args_preview must contain the path argument"
+        );
+        assert_eq!(
+            trace["events"][0]["args_preview"], "",
+            "session_started args_preview must be empty"
+        );
+        assert_eq!(
+            trace["events"][3]["args_preview"], "",
+            "session_finished args_preview must be empty"
         );
     }
 
@@ -1413,9 +797,6 @@ mod tests {
 
     #[test]
     fn trace_event_detail_redacts_sensitive_token_in_turn_output() {
-        // Regression test for S-048: a sensitive token present in a turn's output
-        // must not appear verbatim in the trace event detail field.
-        // trace_events() builds detail via trace_preview(), which calls redact().
         let repo = tempfile::TempDir::new().unwrap();
         let repo_path = repo.path().to_str().unwrap();
         let mut agent = test_agent(repo_path);
@@ -1426,8 +807,6 @@ mod tests {
             thought: "Reading config".to_string(),
             tool: "read_file".to_string(),
             args: serde_json::json!({ "path": "config.toml" }),
-            // Output contains a raw secret token — simulates a file read that
-            // returned a line with an API key.
             output: "host=localhost\napi_key=ultraSecret99\nport=8080".to_string(),
             success: true,
         });
@@ -1458,7 +837,6 @@ mod tests {
 
     #[test]
     fn trace_event_detail_redacts_sensitive_token_in_turn_thought() {
-        // Regression: sensitive token in the thought field must also be redacted.
         let repo = tempfile::TempDir::new().unwrap();
         let repo_path = repo.path().to_str().unwrap();
         let mut agent = test_agent(repo_path);
@@ -1466,7 +844,6 @@ mod tests {
 
         agent.history_mut().push(Turn {
             step: 1,
-            // Thought echoes back what looked like a secret from context.
             thought: "Found password=letmein in env, proceeding.".to_string(),
             tool: "run_command".to_string(),
             args: serde_json::json!({ "program": "env" }),
@@ -1500,14 +877,9 @@ mod tests {
 
     #[test]
     fn restore_task_state_clears_session_local_signals() {
-        // S-053 regression: recent_signatures and recent_progress_markers from
-        // the previous session must not carry stall/loop signal into the new one.
         let repo = tempfile::TempDir::new().unwrap();
         let mut agent = test_agent(repo.path().to_str().unwrap());
 
-        // Build a TaskState that would trigger strategy_change_required() —
-        // four consecutive exploration signatures in recent_signatures and
-        // four "exploration" markers in recent_progress_markers.
         let stale_json = r#"{
   "goal": "fix the auth bug",
   "attempted_actions": ["step 1: read_file (path=src/auth.rs)"],
@@ -1536,14 +908,12 @@ mod tests {
         let restored = agent.restore_task_state_from_disk();
         assert!(restored, "restore should succeed for a resume-worthy state");
 
-        // Cross-session context is preserved.
         assert_eq!(agent.task_state().goal(), Some("fix the auth bug"));
         assert_eq!(
             agent.task_state().next_best_action_hint(),
             Some("Run focused verification before broader edits.")
         );
 
-        // Session-local signal fields are cleared.
         assert!(
             !agent.task_state().has_recent_stall_pressure(),
             "stall pressure must be cleared after restore"
@@ -1555,6 +925,266 @@ mod tests {
         assert!(
             !agent.task_state().has_exploration_pressure(),
             "exploration pressure must be cleared after restore"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_warns_about_stale_plan_file_when_present() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.set_resumed_from_task_state(true);
+        std::fs::write(repo.path().join("PLAN.md"), "# Plan\n- step 1\n").unwrap();
+        agent.task_state_mut().set_goal("fix the parser");
+
+        let guidance = agent.resume_guidance().expect("guidance must be present");
+        assert!(
+            guidance.contains("PLAN.md"),
+            "guidance must mention the plan file path: {guidance}"
+        );
+        assert!(
+            guidance.contains("Verify it still reflects"),
+            "guidance must warn to verify the plan: {guidance}"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_warns_about_ai_plan_file_when_present() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.set_resumed_from_task_state(true);
+        std::fs::create_dir_all(repo.path().join(".ai")).unwrap();
+        std::fs::write(repo.path().join(".ai/plan.md"), "# Plan\n").unwrap();
+        agent.task_state_mut().set_goal("fix the parser");
+
+        let guidance = agent.resume_guidance().expect("guidance must be present");
+        assert!(
+            guidance.contains(".ai/plan.md"),
+            "guidance must mention .ai/plan.md: {guidance}"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_omits_plan_warning_when_no_plan_file() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.set_resumed_from_task_state(true);
+        agent.task_state_mut().set_goal("fix the parser");
+
+        let guidance = agent.resume_guidance().expect("guidance must be present");
+        assert!(
+            !guidance.contains("plan file exists"),
+            "no plan warning when no file present: {guidance}"
+        );
+    }
+
+    #[test]
+    fn resume_guidance_omits_plan_warning_when_not_resumed() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let agent = test_agent(repo.path().to_str().unwrap());
+        std::fs::write(repo.path().join("PLAN.md"), "# Plan\n").unwrap();
+
+        assert!(
+            agent.resume_guidance().is_none(),
+            "resume_guidance must return None when session is not resumed"
+        );
+    }
+
+    #[test]
+    fn session_finish_report_includes_decisions_section_when_present() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let repo_path = repo.path().to_str().unwrap();
+        let mut agent = test_agent(repo_path);
+        agent.session_init();
+
+        // Pre-write a session_decisions.md as append_decision would
+        let state_dir = repo.path().join(".ai").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("session_decisions.md"),
+            "\n## Step 2 - 2024-01-01 00:00:00 [developer]\nTool: str_replace\nDecision: str_replace preferred over write_file for targeted edit\n",
+        ).unwrap();
+
+        agent.history_mut().push(crate::history::Turn {
+            step: 1,
+            thought: "Edit config".to_string(),
+            tool: "str_replace".to_string(),
+            args: serde_json::json!({ "path": "config.toml" }),
+            output: "ok".to_string(),
+            success: true,
+        });
+
+        let artifacts = agent
+            .session_finish(
+                "Targeted edit",
+                "done",
+                StopReason::Success,
+                1,
+                std::time::Instant::now(),
+                "2024-01-01 00:00:00",
+            )
+            .expect("top-level session should produce artifacts");
+
+        let report = std::fs::read_to_string(artifacts.log_path).unwrap();
+        assert!(report.contains("## Decisions"), "report must include Decisions section");
+        assert!(
+            report.contains("str_replace preferred over write_file"),
+            "report must include decision text"
+        );
+    }
+
+    #[test]
+    fn session_finish_report_omits_decisions_section_when_absent() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let repo_path = repo.path().to_str().unwrap();
+        let mut agent = test_agent(repo_path);
+        agent.session_init();
+
+        agent.history_mut().push(crate::history::Turn {
+            step: 1,
+            thought: "Read config".to_string(),
+            tool: "read_file".to_string(),
+            args: serde_json::json!({ "path": "config.toml" }),
+            output: "ok".to_string(),
+            success: true,
+        });
+
+        let artifacts = agent
+            .session_finish(
+                "Inspect config",
+                "done",
+                StopReason::Success,
+                1,
+                std::time::Instant::now(),
+                "2024-01-01 00:00:00",
+            )
+            .expect("top-level session should produce artifacts");
+
+        let report = std::fs::read_to_string(artifacts.log_path).unwrap();
+        assert!(
+            !report.contains("## Decisions"),
+            "report must NOT include Decisions section when no decisions were recorded"
+        );
+    }
+
+    #[test]
+    fn find_stale_plan_file_prefers_ai_plan_over_root_plan() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.set_resumed_from_task_state(true);
+        std::fs::create_dir_all(repo.path().join(".ai")).unwrap();
+        std::fs::write(repo.path().join(".ai/plan.md"), "plan a").unwrap();
+        std::fs::write(repo.path().join("PLAN.md"), "plan b").unwrap();
+
+        let found = agent.find_stale_plan_file();
+        assert_eq!(found.as_deref(), Some(".ai/plan.md"));
+    }
+
+    #[test]
+    fn find_stale_plan_file_finds_canonical_current_plan() {
+        // .ai/state/current_plan.md is the canonical path written by memory_write("plan").
+        // It must be found even when no legacy plan files exist.
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.set_resumed_from_task_state(true);
+        let state_dir = repo.path().join(".ai").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("current_plan.md"), "# Plan\n- step 1\n").unwrap();
+
+        let found = agent.find_stale_plan_file();
+        assert_eq!(
+            found.as_deref(),
+            Some(".ai/state/current_plan.md"),
+            "canonical plan must be found"
+        );
+    }
+
+    #[test]
+    fn find_stale_plan_file_prefers_canonical_over_legacy() {
+        // When both .ai/state/current_plan.md and a legacy file exist, the canonical
+        // path must be returned first — it is checked first in the candidates array.
+        let repo = tempfile::TempDir::new().unwrap();
+        let mut agent = test_agent(repo.path().to_str().unwrap());
+        agent.set_resumed_from_task_state(true);
+        let state_dir = repo.path().join(".ai").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("current_plan.md"), "# Canonical plan").unwrap();
+        std::fs::write(repo.path().join("PLAN.md"), "# Legacy plan").unwrap();
+
+        let found = agent.find_stale_plan_file();
+        assert_eq!(
+            found.as_deref(),
+            Some(".ai/state/current_plan.md"),
+            "canonical path must take priority over legacy PLAN.md"
+        );
+    }
+
+    #[test]
+    fn session_finish_removes_old_log_files_older_than_30_days() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let repo_path = repo.path().to_str().unwrap();
+        let mut agent = test_agent(repo_path);
+        agent.session_init();
+
+        // Create a stale .log file (older than 30 days) in the logs directory.
+        let logs_dir = repo.path().join(".ai").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let stale_log = logs_dir.join("background-old.log");
+        std::fs::write(&stale_log, "old log content").unwrap();
+        let stale_mtime = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(32 * 24 * 60 * 60),
+        );
+        filetime::set_file_mtime(&stale_log, stale_mtime).unwrap();
+
+        agent.session_finish(
+            "cleanup test",
+            "done",
+            StopReason::Success,
+            0,
+            std::time::Instant::now(),
+            "2024-01-01 00:00:00",
+        );
+
+        assert!(
+            !stale_log.exists(),
+            "stale .log file must be removed by session_finish cleanup"
+        );
+    }
+
+    #[test]
+    fn session_finish_cleans_stale_pid_files_when_background_group_enabled() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let repo_path = repo.path().to_str().unwrap();
+
+        // Create agent with background group enabled.
+        let cfg = AgentConfig {
+            tool_groups: vec!["background".to_string()],
+            ..AgentConfig::default()
+        };
+        let mut agent = SweAgent::new(cfg, repo_path, 5, Role::Developer).unwrap();
+        agent.session_init();
+
+        // Create a stale .pid file in the state directory.
+        let state_dir = repo.path().join(".ai").join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let stale_pid = state_dir.join("proc-old.pid");
+        std::fs::write(&stale_pid, "99999").unwrap();
+        let stale_mtime = filetime::FileTime::from_system_time(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60),
+        );
+        filetime::set_file_mtime(&stale_pid, stale_mtime).unwrap();
+
+        agent.session_finish(
+            "background cleanup test",
+            "done",
+            StopReason::Success,
+            0,
+            std::time::Instant::now(),
+            "2024-01-01 00:00:00",
+        );
+
+        assert!(
+            !stale_pid.exists(),
+            "stale .pid file must be removed when background group is enabled"
         );
     }
 }

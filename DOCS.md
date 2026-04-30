@@ -42,7 +42,10 @@ cargo install do_it
 cd /path/to/project
 do_it init
 
-# 3. Run
+# 3. Validate configuration and workspace
+do_it check
+
+# 4. Run
 do_it run --task "Find and fix the bug in src/parser.rs" --repo /path/to/project
 
 # With a role (recommended for smaller models)
@@ -53,6 +56,7 @@ With Ollama:
 ```bash
 ollama pull qwen3.5:cloud
 do_it init --backend ollama --model qwen3.5:cloud --yes
+do_it check
 ```
 
 With OpenAI or compatible:
@@ -120,7 +124,7 @@ Configuration is loaded from the first file found in this priority order:
 On first run, `~/.do_it/` is created with a default `config.toml` and supporting files.
 
 ```toml
-# ── LLM backend ───────────────────────────────────────────────────────────────
+# ── LLM backend ────────────────────────────────────────────────────────────────────────────────
 # llm_backend: "ollama" | "openai" | "anthropic"
 llm_backend      = "ollama"
 llm_url          = "http://localhost:11434"
@@ -141,6 +145,9 @@ history_window   = 8
 # Max characters in tool output before truncation
 max_output_chars = 6000
 
+# Maximum sub-agent nesting depth
+max_depth        = 3
+
 # Logging configuration
 log_level  = "info"    # "error", "warn", "info", "debug", "trace"
 log_format = "text"    # "text", "json"
@@ -156,6 +163,11 @@ log_format = "text"    # "text", "json"
 # search    = "qwen3.5:9b"
 # execution = "qwen3.5:9b"
 # vision    = "qwen3.5:cloud"
+
+# Optional: browser backend (AWP)
+# [browser]
+# awp_url        = "http://127.0.0.1:9222"
+# screenshot_dir = ".ai/screenshots"
 ```
 
 ### Backend examples
@@ -177,7 +189,7 @@ model       = "qwen3.5:35b"
 **OpenAI:**
 ```toml
 llm_backend = "openai"
-llm_url     = "https://api.openai.com"
+llm_url     = "https://api.openai.com/v1"
 llm_api_key = "sk-..."
 model       = "gpt-4o"
 ```
@@ -185,7 +197,7 @@ model       = "gpt-4o"
 **Anthropic:**
 ```toml
 llm_backend = "anthropic"
-llm_url     = "https://api.anthropic.com"
+llm_url     = "https://api.anthropic.com/v1"
 llm_api_key = "sk-ant-..."
 model       = "claude-sonnet-4-5-20251001"
 ```
@@ -193,7 +205,7 @@ model       = "claude-sonnet-4-5-20251001"
 **MiniMax (OpenAI-compatible):**
 ```toml
 llm_backend = "openai"
-llm_url     = "https://api.minimax.io"
+llm_url     = "https://api.minimax.io/v1"
 llm_api_key = "..."
 model       = "abab6.5s-chat"
 ```
@@ -206,7 +218,7 @@ model       = "my-local-model"
 # no llm_api_key needed
 ```
 
-The `llm_api_key` field can also be supplied via the `LLM_API_KEY` environment variable — useful in CI or when you prefer not to store keys in config files.
+The `llm_api_key` field can also be supplied via the `LLM_API_KEY` environment variable.
 
 ### Defaults
 
@@ -220,8 +232,11 @@ The `llm_api_key` field can also be supplied via the `LLM_API_KEY` environment v
 | `max_tokens` | `4096` |
 | `history_window` | `8` |
 | `max_output_chars` | `6000` |
+| `max_depth` | `3` |
 | `log_level` | `info` |
 | `log_format` | `text` |
+
+### Optional tool groups
 
 ```toml
 # Enable optional tool groups (browser, background, github)
@@ -246,15 +261,32 @@ do_it config --config custom.toml
 ```
 do_it run     Run the agent on a task
 do_it init    Initialise a project workspace
+do_it check   Dry-run validation: config, runtime, workspace
 do_it config  Print resolved config and exit
 do_it roles   List all roles with their tool allowlists
 do_it status  Show current project status
 ```
 
-`do_it status` currently summarizes:
-- session report files in `.ai/logs/`
-- structured trace files in `.ai/logs/`
-- compact path-sensitivity diagnostics from the latest structured trace, when present
+### `do_it check`
+
+Validation command for CI and setup verification:
+
+- config load source
+- static config validation
+- runtime validation (Ollama model reachability; non-Ollama backends log a warning, not an error)
+- `.ai/` workspace structure
+- optional tool group checks (`browser`, `github`, `background`)
+
+Exits non-zero when any check fails.
+
+### `do_it status`
+
+Summarizes:
+
+- session count and config source
+- recent session markdown reports in `.ai/logs/`
+- recent structured trace files in `.ai/logs/`
+- compact path-sensitivity diagnostics from the latest structured trace
 - `last_session.md`
 - `current_plan.md`
 - `~/.do_it/tool_wishlist.md`
@@ -312,7 +344,6 @@ do_it run --task "Refactor auth module" --role developer --max-steps 50
 
 # Continue after interruption
 do_it run --task "continue" --max-steps 50
-
 ```
 
 `--task` and `--system-prompt`: if the value is a path to an existing file, its contents are read; if the extension is an image (`.png`, `.jpg`, `.webp`, etc.), vision mode is activated.
@@ -335,18 +366,32 @@ Roles restrict the agent to a focused tool set and apply a role-specific system 
 do_it roles   # print all roles and their allowlists
 ```
 
+Short aliases accepted by CLI/config parsing:
+
+- `developer` / `dev`
+- `navigator` / `nav`
+- `reviewer` / `review`
+
 ### Role table
 
-| Role | Purpose | Core tools (≤ 12–14) |
+| Role | Purpose | Key capabilities |
 |---|---|---|
 | `default` | No restrictions | all tools |
 | `boss` | Orchestration — delegates everything, never writes code | `memory`, `tree`, `project_map`, `web_search`, `ask_human`, `notify`, `spawn_agent/s`, `tool_request`, `capability_gap` |
 | `research` | Information gathering | `web_search`, `fetch_url`, `memory`, `ask_human` |
-| `developer` | Write and run code — uses navigator sub-agent for exploration | `read_file`, `write_file`, `str_replace`, `apply_patch_preview`, `run_command`, `run_targeted_test`, `format_changed_files_only`, `run_script`, `git_*`, `memory`, `notify` |
-| `navigator` | Explore codebase — read-only | `read_file`, `list_dir`, `find_files`, `search_in_files`, `tree`, `get_symbols`, `outline`, `find_references`, `project_map`, `trace_call_path`, `memory` |
-| `qa` | Testing and verification | `read_file`, `search_in_files`, `run_command`, `run_script`, `diff_repo`, `read_test_failure`, `test_coverage`, `git_*`, `memory`, `notify` |
+| `developer` | Write and run code — uses navigator sub-agent for exploration | `read_file`, `open_file_region`, `write_file`, `str_replace`, `str_replace_multi`, `str_replace_fuzzy`, `apply_patch_preview`, `run_command`, `run_targeted_test`, `format_changed_files_only`, `run_script`, `diff_repo`, `git_*`, `memory`, `notify` |
+| `navigator` | Explore codebase — read-only | `read_file`, `list_dir`, `find_files`, `search_in_files`, `tree`, `get_symbols`, `outline`, `find_references`, `project_map`, `find_entrypoints`, `trace_call_path`, `memory` |
+| `qa` | Testing and verification | `read_file`, `search_in_files`, `run_command`, `run_script`, `diff_repo`, `read_test_failure`, `test_coverage`, `run_targeted_test`, `git_*`, `memory`, `notify` |
 | `reviewer` | Static code review — no execution | `read_file`, `search_in_files`, `diff_repo`, `git_log`, `get_symbols`, `outline`, `get_signature`, `find_references`, `ask_human`, `memory` |
 | `memory` | Managing `.ai/` state | `memory_read`, `memory_write`, `memory_delete` |
+
+Optional groups extend named roles only when enabled in `config.toml`:
+
+| Group | Tools | Roles |
+|---|---|---|
+| `browser` | `browser_action`, `browser_get_text`, `browser_navigate`, `screenshot` | boss, developer, qa, reviewer |
+| `background` | `run_background`, `process_status`, `process_list`, `process_kill` | boss, developer |
+| `github` | `github_api` | developer, qa |
 
 ### System prompt priority
 
@@ -384,69 +429,57 @@ The file is picked up automatically — no restart needed.
 
 All tools are implemented in native Rust under `src/tools/`.
 
-The tool surface is no longer documented only by hand-written prompts:
-- canonical names, aliases, role availability, dispatch kind, and capability status live in a shared registry (`src/tools/spec.rs`)
-- role prompts inject their `## Available tools` section from that registry at runtime
-- generated tool catalogs mark non-real tools as:
-  - `[limited]` for stubbed tools
-  - `[experimental]` for tools with a narrower or unstable runtime contract
+The canonical registry lives in `src/tools/spec.rs`. It defines canonical names, aliases, role availability, dispatch kind, and capability status. Role prompts inject their `## Available tools` section from that registry at runtime. Generated tool catalogs mark non-real tools:
 
-This makes prompts, allowlists, and runtime dispatch significantly more consistent than before.
+- `[limited]` for stubbed tools
+- `[experimental]` for tools with a narrower or unstable runtime contract
 
 ### Filesystem
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `read_file` | `path`, `start_line?`, `end_line?` | Read file with line numbers (default: first 100 lines) |
+| `read_file` | `path`, `start_line?`, `end_line?` | Read file with line numbers |
+| `open_file_region` | `path`, `line`, `before?`, `after?` | Focused region around a line |
 | `write_file` | `path`, `content` | Overwrite file, create directories if needed |
 | `str_replace` | `path`, `old_str`, `new_str` | Replace a unique string in a file |
-| `apply_patch_preview` | `path`, `content?` or `old_str` + `new_str` | Preview an edit as a unified diff without writing it |
+| `str_replace_multi` | `path`, `edits[]` | Atomic multi-edit replacement |
+| `str_replace_fuzzy` | `path`, `old_str`, `new_str` | Whitespace-tolerant replacement `[experimental]` |
+| `apply_patch_preview` | `path`, `content?` or `old_str` + `new_str` | Preview an edit as a unified diff, no write `[experimental]` |
 | `list_dir` | `path?` | List directory contents (one level) |
 | `find_files` | `pattern`, `dir?` | Find files by name: `*.rs`, `test*`, substring |
 | `search_in_files` | `pattern`, `dir?`, `ext?` | Regex search across file contents |
-| `tree` | `dir?`, `depth?`, `ignore?` | Recursive directory tree (ignores `target`, `.git`, etc. by default) |
+| `tree` | `dir?`, `depth?`, `ignore?` | Recursive directory tree |
 
-`apply_patch_preview` is currently `[experimental]`. It supports:
-- write-style preview via `path + content`
-- targeted replace preview via `path + old_str + new_str`
-- no filesystem writes; the current file stays untouched
-- unified diff output intended for fast review before a real edit
+`apply_patch_preview` and `str_replace_fuzzy` are `[experimental]`. Graduation criteria for each are documented in `src/tools/spec.rs` next to their registry entries.
 
 ### Execution
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `run_command` | `program`, `args[]`, `cwd?` | Run a program with explicit args array (no shell) |
-| `format_changed_files_only` | `dir?`, `check_only?`, `timeout_secs?` | Format only changed Rust files detected from git status |
-| `run_targeted_test` | `path?`, `test?`, `kind?`, `target?`, `dir?` | Run a narrow Rust test target inferred from file path or explicit target |
+| `run_command` | `program`, `args[]`, `cwd?`, `timeout_secs?` | Run a program with explicit args array (no shell) |
+| `format_changed_files_only` | `dir?`, `check_only?`, `timeout_secs?` | Format only changed Rust files detected from git status `[experimental]` |
+| `run_targeted_test` | `path?`, `test?`, `kind?`, `target?`, `dir?` | Run a narrow Rust test target `[experimental]` |
 | `run_script` | `script`, `dir?` | Run a sandboxed Rhai script for lightweight parsing and summarization |
 | `diff_repo` | `base?`, `staged?`, `stat?` | Git diff vs HEAD or any ref |
+| `read_test_failure` | `path?`, `test?`, `index?` | Extract a failing test block from a log |
+| `test_coverage` | `dir?`, `threshold?`, `timeout_secs?` | Run tests with coverage |
 
-`run_script` is currently `[experimental]`. It exposes a deliberately small host API:
-- `read_lines(path)` — read file lines within the workspace
-- `regex_match(pattern, text)` — regex match helper
-- `parse_json(text)` — parse JSON into Rhai values
-- `log(msg)` — append to script logs returned in the tool result
+`run_script` sandbox API:
 
-Sandbox limits:
-- 1 second wall-clock budget
-- operation, depth, string, array, and map size limits
-- output capped at 512 KB
-- no network, process spawning, or unrestricted filesystem access
+```rhai
+read_lines("path")                 // Array of strings, one per line
+read_text("path")                  // full file as one string
+list_dir("path")                   // Array of entry names in a directory (sorted)
+file_exists("path")                // bool — true when path exists
+regex_match("pattern", text)       // bool
+regex_find_all("pattern", text)    // Array of match strings
+parse_json(text)                   // Map/Array/scalar
+fnv64(text)                       // FNV-1a 64-bit hash as hex (non-cryptographic; change detection only)
+log("message")                     // shown under "Logs:" in output
+write_text("path", "content")      // only with allow_write: true
+```
 
-`run_targeted_test` is currently `[experimental]` and Rust-first:
-- `path: "src/..."` narrows to `cargo test --lib`
-- `path: "tests/<target>/..."` narrows to `cargo test --test <target>`
-- `test` adds a standard cargo test filter
-- `kind` can force `auto`, `lib`, `test`, or `package`
-- Node/Python fallback branches are intentionally deferred until the Rust-first workflow is stable
-
-`format_changed_files_only` is currently `[experimental]` and Rust-first:
-- reads changed paths from `git status --porcelain`
-- filters to changed `.rs` files only
-- runs `rustfmt` just on those files instead of the whole repo
-- `check_only: true` switches to `rustfmt --check`
-- Node/Python formatter fallbacks are intentionally deferred until the Rust-first workflow is stable
+Sandbox limits: 30 second wall-clock, bounded operations/depth/string/array/map sizes, workspace-scoped filesystem, no network or process spawning.
 
 ### Background Processes
 
@@ -455,9 +488,7 @@ Sandbox limits:
 | `run_background` | `program`, `args[]`, `cwd?`, `id`, `cmd?` | Start a named background process |
 | `process_status` | `id` or `pid` | Check if a background process is still running |
 | `process_kill` | `id` or `pid` | Terminate a background process |
-| `process_list` |  | List all tracked background processes |
-
-Current state: these tools are real. They spawn OS processes, track real PIDs, support lookup by stable `id`, and keep a recent stdout/stderr excerpt for status inspection.
+| `process_list` | | List all tracked background processes |
 
 ### Git
 
@@ -474,23 +505,22 @@ Current state: these tools are real. They spawn OS processes, track real PIDs, s
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `web_search` | `query`, `max_results?` | Search via DuckDuckGo (no API key required) |
+| `web_search` | `query`, `max_results?` | Search via DuckDuckGo HTML endpoint (no API key required) |
 | `fetch_url` | `url`, `selector?` | Fetch a web page and return readable text |
-| `github_api` | `method`, `endpoint`, `body?`, `token?` | GitHub REST API — issues, PRs, branches, commits, file contents |
+| `github_api` | `method`, `endpoint`, `body?`, `token?` | GitHub REST API |
 
-`github_api` requires a `GITHUB_TOKEN` environment variable (or `token` argument). Responses are automatically filtered to keep context concise — file contents are base64-decoded automatically.
+`web_search` uses a proper DOM parser (`scraper` crate) for HTML extraction, handling minified pages and multi-line tags correctly. Rate limiting is applied via the shared global limiter.
 
-Common endpoints:
+`fetch_url` supports `http`, `https`, and `file://` URLs. SSRF protection is always applied. Optional `allowlist` and `blocklist` arrays restrict or block specific domains.
+
+`github_api` requires a `GITHUB_TOKEN` environment variable (or `token` argument). Common endpoints:
+
 ```
-GET  /repos/{owner}/{repo}/issues              — list open issues
-GET  /repos/{owner}/{repo}/issues/{n}          — read single issue
-POST /repos/{owner}/{repo}/issues/{n}/comments — post a comment
-PATCH /repos/{owner}/{repo}/issues/{n}         — update issue (state/labels)
-GET  /repos/{owner}/{repo}/pulls               — list open PRs
-POST /repos/{owner}/{repo}/pulls               — create PR
-PUT  /repos/{owner}/{repo}/pulls/{n}/merge     — merge PR
-GET  /repos/{owner}/{repo}/branches            — list branches
-GET  /repos/{owner}/{repo}/contents/{path}     — read file (auto-decoded)
+GET  /repos/{owner}/{repo}/issues
+GET  /repos/{owner}/{repo}/issues/{n}
+POST /repos/{owner}/{repo}/issues/{n}/comments
+GET  /repos/{owner}/{repo}/pulls
+GET  /repos/{owner}/{repo}/contents/{path}
 ```
 
 ### Code Intelligence
@@ -503,18 +533,9 @@ Tree-sitter backend. Supports Rust, TypeScript/JavaScript, Python, C++, Kotlin. 
 | `outline` | `path` | Structural overview with signatures and line numbers |
 | `get_signature` | `path`, `name`, `lines?` | Full signature + doc comment for a named symbol |
 | `find_references` | `name`, `dir?`, `ext?` | All usages of a symbol across the codebase |
-
-`kinds` filter examples: `"fn,struct"`, `"class,interface"`, `"fn,method"`.
-
-### Testing
-
-| Tool | Arguments | Description |
-|---|---|---|
-| `test_coverage` | `dir?`, `threshold?`, `timeout_secs?` | Run tests with coverage (auto-detects project type). Enforces threshold (default: 80%). |
-
-Current state: Rust projects are supported. The tool prefers `cargo llvm-cov`, falls back to `cargo tarpaulin`, and falls back again to `cargo test` when no coverage backend is installed, returning a clear note that coverage numbers are unavailable. Non-Rust project types still return a clean "not implemented yet" result.
-
-`run_targeted_test` complements this by making the inner edit/test loop cheaper before QA runs broader coverage or full-suite verification.
+| `project_map` | `dir?`, `depth?` | Project layout summary |
+| `find_entrypoints` | `dir?`, `depth?`, `limit?` | Locate app/CLI/web/test entrypoints |
+| `trace_call_path` | `symbol`, `dir?`, `depth?` | Caller chain for a symbol |
 
 ### Memory (`.ai/` hierarchy)
 
@@ -523,38 +544,26 @@ Current state: Rust projects are supported. The tool prefers `cargo llvm-cov`, f
 | `memory_read` | `key` | Read a memory entry |
 | `memory_write` | `key`, `content`, `append?` | Write or append to a memory entry |
 | `memory_delete` | `key` | Delete a memory entry |
+| `checkpoint` | `note` | Record mid-task progress without finishing |
 
-**Logical key mapping:**
+**Logical key mapping (reserved keys):**
 
 | Key | File |
 |---|---|
 | `plan` | `.ai/state/current_plan.md` |
 | `last_session` | `.ai/state/last_session.md` |
-| `session_counter` | `.ai/state/session_counter.txt` |
-| `external` | `.ai/state/external_messages.md` |
-| `history` | `.ai/logs/history.md` |
-| `knowledge/<n>` | `.ai/knowledge/<n>.md` |
-| `prompts/<n>` | `.ai/prompts/<n>.md` |
+| `external_messages` | `.ai/state/external_messages.md` |
 | `user_profile` | `~/.do_it/user_profile.md` (global) |
 | `boss_notes` | `~/.do_it/boss_notes.md` (global) |
-| any other key | `.ai/knowledge/<key>.md` |
-
-**Persistent knowledge keys used by built-in roles:**
-
-| Key | Written by | Purpose |
-|---|---|---|
-| `knowledge/lessons_learned` | QA | Project-specific pitfalls and correct patterns |
-| `knowledge/decisions` | Boss, Developer | Architectural decisions and rationale |
-| `knowledge/qa_report` | QA | Latest test run report |
-| `knowledge/review_report` | Reviewer | Latest static code review |
-| `knowledge/<role>_result` | Sub-agents | Results from `spawn_agent` calls |
+| `tool_wishlist` | `~/.do_it/tool_wishlist.md` (global) |
+| any other key | `.ai/memory/<key>.txt` (namespaced: `.ai/memory/<ns>/<key>.txt`) |
 
 ### Communication
 
 | Tool | Arguments | Description |
 |---|---|---|
 | `ask_human` | `question` | Send a question via Telegram and wait up to 5 min for reply; falls back to console |
-| `notify` | `message`, `silent?` | Send a one-way Telegram notification (non-blocking, no waiting) |
+| `notify` | `message`, `silent?` | Send a one-way Telegram notification (non-blocking) |
 | `finish` | `summary`, `success` | Signal task completion |
 
 ### Multi-agent
@@ -562,36 +571,25 @@ Current state: Rust projects are supported. The tool prefers `cargo llvm-cov`, f
 | Tool | Arguments | Description |
 |---|---|---|
 | `spawn_agent` | `role`, `task`, `memory_key?`, `max_steps?` | Delegate a subtask to a specialised sub-agent |
-| `spawn_agents` | `agents[]` | Spawn multiple sub-agents in parallel |
+| `spawn_agents` | `agents[]`, `timeout_secs?` | Delegate multiple subtasks (see note below) |
 
 ### Browser
 
-Browser tools are currently `[experimental]`.
+Browser tools are currently `[experimental]`. Enabled via `tool_groups = ["browser"]`.
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `screenshot` | `url?`, `path?` | Optionally navigate, then save a PNG screenshot to a workspace path |
-| `browser_get_text` | `url?`, `selector?` | Read rendered text from the current page or an optionally provided URL |
-| `browser_action` | `action`, `selector?`, `value?`, `url?` | Interact with an element: `click`, `type`, `hover`, `clear`, `select`, `scroll` |
-| `browser_navigate` | `url` | Navigate and wait for page load |
-
-Current runtime behavior:
-- the implementation launches `headless_chrome` directly
-- `AgentConfig.browser` exists but is not yet the source of truth for browser startup
-- if browser startup fails, the tool returns the real startup error from the browser backend
-
-So the browser contract is usable, but the config-driven setup described below is still aspirational and not fully wired.
+| `screenshot` | `url?`, `path?` | Optionally navigate, then save a PNG screenshot |
+| `browser_get_text` | `url?`, `selector?` | Read rendered text from the current page or URL |
+| `browser_action` | `action`, `url`, `ref?`, `css?`, `value?`, `wait_ms?` | Interact: `click`, `type`, `hover`, `clear`, `select`, `scroll` (`url` required every call) `[experimental]` |
+| `browser_navigate` | `url`, `wait_ms?` | Navigate and wait for page load. `file://` not supported — serve files via HTTP first. `[experimental]` |
 
 ### Self-improvement
 
 | Tool | Arguments | Description |
 |---|---|---|
 | `tool_request` | `name`, `description`, `motivation`, `priority?` | Request a new tool — appends to `~/.do_it/tool_wishlist.md` |
-| `capability_gap` | `context`, `impact` | Report a structural blind spot without a specific solution — appends to wishlist |
-
-`tool_request` and `capability_gap` are available to `boss` and `default` roles. The Boss calls `tool_request` when it encounters a missing capability for the second time in any session, and `capability_gap` when it observes something it structurally cannot do.
-
-See [Sub-agent Architecture](#sub-agent-architecture) for details.
+| `capability_gap` | `context`, `impact` | Report a structural blind spot |
 
 ---
 
@@ -611,9 +609,7 @@ telegram_chat_id = "123456789"
 
 ### ask_human
 
-Sends a question and waits up to 5 minutes for your reply. Your reply is returned to the agent as the tool result. Falls back to console stdin if Telegram is not configured or unreachable.
-
-Use this when the agent needs a decision before continuing — it will not guess on important choices.
+Sends a question and waits up to 2 minutes for your reply. Your reply is returned to the agent as the tool result. Falls back to console stdin if Telegram is not configured or unreachable.
 
 ### notify
 
@@ -622,13 +618,10 @@ Sends a one-way message with no waiting. Used for progress updates and completio
 ```json
 { "tool": "notify", "args": { "message": "OAuth implementation complete, running tests..." } }
 ```
-```json
-{ "tool": "notify", "args": { "message": "All tests pass. PR created.", "silent": true } }
-```
 
 ### External messages (inbox)
 
-To send instructions to the agent before its next run, write to `.ai/state/external_messages.md`. On startup, the agent reads this file, injects it into context, and clears it. Any external process — a webhook, a cron script, another agent — can write to this file.
+To send instructions to the agent before its next run, write to `.ai/state/external_messages.md`. On startup, the agent reads this file, injects it into context, and clears it.
 
 ```bash
 echo "## 2026-01-15 10:30
@@ -645,76 +638,48 @@ Browser tools give the agent eyes — the ability to see rendered pages, interac
 
 ### Setup
 
-The agent speaks CDP (Chrome DevTools Protocol). The backend is transparent — swap `cdp_url` to change from Chrome to Lightpanda or any future CDP-compatible browser without changing any agent code.
+The agent uses the **AWP protocol** — a WebSocket-based JSON protocol for browser automation. The client connects to `ws://host:port/`, performs a session handshake (`awp.hello` → `session.create`), issues page commands, then closes the session cleanly (`session.close` + WebSocket Close frame).
 
 ```toml
 # config.toml
 [browser]
-# Option 1: connect to a running CDP server
-cdp_url = "ws://127.0.0.1:9222"
-
-# Option 2: launch Chrome locally (requires chromiumoxide feature — coming in a future version)
-# chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-
-# Screenshot output directory (default: .ai/screenshots)
-# screenshot_dir = ".ai/screenshots"
+awp_url        = "http://127.0.0.1:9222"
+# screenshot_dir = ".ai/screenshots"   # default: .ai/screenshots
 ```
 
-Start a CDP server before running the agent:
+Start the AWP server before running the agent:
 
 ```bash
-# Chrome (headless)
-google-chrome --headless --remote-debugging-port=9222
-
-# Lightpanda — lightweight, designed for AI, 9x less RAM than Chrome
-# Linux/macOS binary:
-lightpanda serve --host 127.0.0.1 --port 9222
-
-# Docker:
-docker run -d --name lightpanda -p 9222:9222 lightpanda/browser:nightly
+# plasmate (recommended — lightweight, designed for AI agents)
+plasmate serve --protocol awp --host 127.0.0.1 --port 9222
 ```
-
-### Planned browser direction
-
-The intended direction is a config-driven CDP/browser backend with cleaner "browser not configured" messages. The current implementation is a simpler direct `headless_chrome` integration, so treat the rest of this section as the target architecture rather than a fully completed contract.
 
 ### How the agent uses browser tools
 
 ```
 screenshot(url)          → PNG saved to .ai/screenshots/
-                           base64 returned for vision model input
 browser_get_text(url)    → full page text after JS execution
 browser_action(...)      → click/type/hover + implicit screenshot
 browser_navigate(url)    → navigate + wait + screenshot
 ```
 
-The Boss uses screenshots to verify UI work directly, without delegating:
+The Boss uses screenshots to verify UI work directly:
 
 ```
 boss: spawn_agent("developer", "add login form to /login")
-boss: screenshot("http://localhost:3080/login")  ← sees result
+boss: screenshot("http://localhost:3080/login")
 boss: browser_action("type", "#email", "test@example.com")
 boss: browser_action("click", "#submit")
-boss: screenshot("http://localhost:3080/dashboard")  ← sees result after login
-```
-
-The Developer uses browser tools for visual feedback after UI changes:
-```
-developer: write_file("src/components/Login.rs", ...)
-developer: run_command("trunk", ["build"])
-developer: screenshot("http://localhost:3080/login")  ← verify rendering
+boss: screenshot("http://localhost:3080/dashboard")
 ```
 
 ### Vision model integration
 
-`screenshot` returns the image as base64. Pass it to a vision-capable model for deeper analysis:
+`screenshot` returns the image as base64. Pass it to a vision-capable model:
 
 ```bash
-# Take a screenshot and describe it
 do_it run --task screenshot.png --role developer
 ```
-
-When browser startup fails, the error is surfaced explicitly. Unknown browser actions are rejected before startup so contract errors do not get masked by environment failures.
 
 ---
 
@@ -724,7 +689,7 @@ The Boss accumulates knowledge about missing capabilities across sessions. Two t
 
 ### tool_request
 
-Called when the Boss encounters a missing capability for the **second time** in any session. Not for first encounters — the agent tries to work around once, then requests.
+Called when the Boss encounters a missing capability for the **second time** in any session:
 
 ```json
 {
@@ -732,7 +697,7 @@ Called when the Boss encounters a missing capability for the **second time** in 
   "args": {
     "name": "run_background",
     "description": "Run a process in the background and keep it alive",
-    "motivation": "Need to start trunk serve and then navigate to localhost, but run_command blocks",
+    "motivation": "Need to start trunk serve and then navigate to localhost",
     "priority": "high"
   }
 }
@@ -740,31 +705,27 @@ Called when the Boss encounters a missing capability for the **second time** in 
 
 ### capability_gap
 
-Called when the Boss observes a structural blind spot — it cannot see or reach something important — and has no specific solution to propose.
+Called when the Boss observes a structural blind spot with no specific solution:
 
 ```json
 {
   "tool": "capability_gap",
   "args": {
-    "context": "Developer wrote a Leptos component but I cannot see how it renders without a browser",
-    "impact": "Visual bugs and layout issues go undetected until manual review"
+    "context": "Developer wrote a Leptos component but I cannot see how it renders",
+    "impact": "Visual bugs go undetected until manual review"
   }
 }
 ```
-
-### Reading the wishlist
 
 ```bash
 cat ~/.do_it/tool_wishlist.md
 ```
 
-Each entry is timestamped and structured. The wishlist is your primary source for understanding what the agent actually needs — derived from real tasks, not speculation.
-
 ---
 
 ## How the Agent Works
 
-### Session initialisation (`src/agent/session.rs`)
+### Session initialisation
 
 ```
 session_init():
@@ -772,9 +733,10 @@ session_init():
   → read last_session.md   → inject into history as step 0
   → restore task_state.json from disk (if resume-worthy)
   → cache boss_notes.md and user_profile.md for prompt use
+  → read external_messages.md → inject into context → clear
 ```
 
-On first run in a new repository, `.ai/project.toml` is scaffolded automatically by detecting `Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod` and reading the GitHub remote from `.git/config`. Edit it freely — it will not be overwritten.
+On first run in a new repository, `.ai/project.toml` is scaffolded automatically by detecting `Cargo.toml` / `package.json` / `pyproject.toml` / `go.mod`:
 
 ```toml
 # .ai/project.toml (auto-generated, edit as needed)
@@ -805,7 +767,7 @@ if --task is an image:
 for each step 1..max_steps:
   0. build prompt from:
      - task
-     - working memory (`goal`, `attempted_actions`, `artifacts_found`, `blocked_on`, `next_best_action`)
+     - working memory (goal, attempted_actions, artifacts_found, blocked_on, next_best_action)
      - recent history
      - status-aware strategy notes for weak/repeated tools
      - project context
@@ -822,39 +784,33 @@ for each step 1..max_steps:
 
 ### Loop detection and anti-loop policy
 
-The runtime now combines raw history with tool capability status from the registry:
-
-- repeated identical `[limited]` tool calls trip loop handling sooner
-- repeated identical `[experimental]` tool calls trip loop handling sooner than normal tools
+- repeated identical `[limited]` or `[experimental]` tool calls trip loop handling sooner than normal tools
 - prompts include `Strategy Notes` when a weak tool already returned the same result with the same args
-- prompts also include `Working Memory`, which helps the model remember blockers and next-best actions
-
-The goal is to interrupt low-value repetition before the agent burns many steps on the same failing tactic.
+- prompts include `Working Memory` to help the model remember blockers and next-best actions
 
 ### Resume behavior
 
 Top-level sessions persist structured working memory in `.ai/state/task_state.json`.
 
-Current behavior:
 - `continue` reuses the saved top-level goal when available
 - the first prompt after restore includes resume guidance from the saved task state
 - persisted task state is restored only for the top-level agent
 - successful top-level completion clears the persisted snapshot
-- failed or interrupted top-level runs keep the snapshot for resume
+- failed or interrupted runs keep the snapshot for resume
 
-Sub-agents intentionally do not restore persisted task state. They start with fresh in-memory working memory so their behavior stays scoped to the current delegated task and remains reproducible.
+Sub-agents intentionally do not restore persisted task state. They start with fresh in-memory working memory scoped to the current delegated task.
 
-Design constraint:
-- `TaskState` is intentionally small and operational
-- it is not a full narrative session transcript
-- avoid adding extra resume metadata unless there is a proven benefit
+**Session recovery hierarchy:** resume data is pulled from multiple sources in priority order:
+1. `task_state.json` — structured working memory (goal, actions, artifacts, blockers)
+2. `.ai/state/last_session.md` — narrative note injected as step 0
+3. stale plan file `.ai/state/current_plan.md` — used only when task_state is absent or empty
 
-This keeps prompt pressure lower and makes the state more usable on weaker models.
+These sources do not conflict: `memory_read("plan")` maps to `.ai/state/current_plan.md`, and `memory_read("last_session")` maps to `.ai/state/last_session.md`, which matches where the lifecycle writes them.
 
-### Context window (`src/history.rs`)
+### Context window
 
 - Last `history_window` steps in full
-- Older steps collapsed to one line: `step N ✓ [tool] → first line of output`
+- Older steps collapsed to one line: `step N ✓ [tool] — thought | first line of output`
 
 ### LLM response parsing
 
@@ -876,7 +832,7 @@ A tool error does not stop the agent — it is recorded in history as a failed s
 | `qwen3.5:35b` | 24 GB | Complex multi-step tasks |
 | `qwen3.5:27b` | 17 GB | Complex multi-step tasks |
 | `qwen3.5:9b` | 6.6 GB | Roles with ≤8 tools (navigator, research) |
-| `qwen3-coder:30b` | 19 Gb | Complex multi-step coding |
+| `qwen3-coder:30b` | 19 GB | Complex multi-step coding |
 | `qwen3-coder-next:cloud` | - | Developer role, best code quality |
 
 ### Per-action-type model routing
@@ -893,32 +849,23 @@ vision    = "qwen3.5:cloud"            # used for image tasks
 
 ### LLM backends
 
-Three wire protocols are supported. Set `llm_backend` in `config.toml` or via `do_it init`:
-
 | Backend | `llm_backend` value | Auth |
 |---|---|---|
 | Ollama | `ollama` | none (local) |
 | OpenAI / compatible | `openai` | `llm_api_key` or `LLM_API_KEY` env |
 | Anthropic / compatible | `anthropic` | `llm_api_key` or `LLM_API_KEY` env |
 
-Any service that implements the OpenAI `/v1/chat/completions` or Anthropic `/v1/messages` API works, including self-hosted proxies and third-party providers. The `llm_url` field sets the base URL — the protocol suffix (`/v1/chat/completions` etc.) is added automatically.
-
-```toml
-# OpenAI-compatible local proxy, no key needed
-llm_backend = "openai"
-llm_url     = "http://localhost:20128/v1"
-model       = "my-local-model"
-```
+Any service implementing the OpenAI `/v1/chat/completions` or Anthropic `/v1/messages` API works. The `llm_url` field sets the base URL; the protocol suffix is added automatically.
 
 ---
 
 ## Sub-agent Architecture
 
-`spawn_agent` lets the `boss` role delegate subtasks to specialised sub-agents. Each sub-agent runs in-process with its own history, role prompt, fresh in-memory working memory, and tool allowlist. Communication between boss and sub-agents goes through the shared `.ai/knowledge/` memory.
+`spawn_agent` lets the `boss` role delegate subtasks to specialised sub-agents. Each sub-agent runs in-process with its own history, role prompt, fresh in-memory working memory, and tool allowlist. Communication goes through the shared `.ai/knowledge/` memory.
 
 Design rule:
 - top-level agent: may restore persisted `TaskState`
-- sub-agent: never restores persisted `TaskState`; always starts clean for the current delegated scope
+- sub-agent: never restores persisted `TaskState`; always starts clean
 
 ### Usage
 
@@ -934,22 +881,16 @@ Design rule:
 }
 ```
 
-After the sub-agent finishes, the boss reads the results:
-
-```json
-{ "tool": "memory_read", "args": { "key": "knowledge/oauth_research" } }
-```
-
 ### Arguments
 
 | Argument | Required | Description |
 |---|---|---|
 | `role` | yes | Sub-agent role: `research`, `developer`, `navigator`, `qa`, `reviewer`, `memory` |
-| `task` | yes | Task description — what the sub-agent should do |
+| `task` | yes | Task description |
 | `memory_key` | no | Where to write results (default: `knowledge/agent_result`) |
 | `max_steps` | no | Step limit (default: parent's `max_steps / 2`, min 5) |
 
-Boss cannot spawn another boss (recursion guard).
+Boss cannot spawn another boss (recursion guard). Maximum nesting depth is controlled by `max_depth` in config (default: 3).
 
 ### Full orchestration example
 
@@ -960,29 +901,22 @@ do_it run --task "Add OAuth2 login to the API" --role boss --max-steps 80
 ```
 boss: reads last_session, plan, decisions, user_profile → writes task breakdown to plan
   │
-  ├─ spawn_agent(role="research", task="find best OAuth crates for Axum",
+  ├─ spawn_agent(role="research", task="find best OAuth crates",
   │              memory_key="knowledge/oauth_research")
-  │    └─ research agent searches web, writes findings
   │
-  ├─ memory_read("knowledge/oauth_research")
-  │
-  ├─ spawn_agent(role="navigator", task="find current auth middleware location",
+  ├─ spawn_agent(role="navigator", task="map existing auth structure",
   │              memory_key="knowledge/auth_structure")
-  │    └─ navigator explores codebase, maps existing code
   │
   ├─ spawn_agent(role="developer", task="implement OAuth2 per the plan",
   │              memory_key="knowledge/impl_notes")
-  │    └─ developer writes code, runs tests, commits
   │
-  ├─ spawn_agent(role="reviewer", task="review the OAuth2 implementation",
+  ├─ spawn_agent(role="reviewer", task="review the implementation",
   │              memory_key="knowledge/review_report")
-  │    └─ reviewer reads code, checks decisions.md, writes structured report
   │
-  ├─ spawn_agent(role="qa", task="verify all tests pass, check coverage",
+  ├─ spawn_agent(role="qa", task="verify tests and coverage",
   │              memory_key="knowledge/qa_report")
-  │    └─ qa runs test_coverage, writes report, appends lessons_learned
   │
-  └─ boss: reads review_report + qa_report → notify("OAuth2 complete") → finish
+  └─ boss: reads reports → notify("OAuth2 complete") → finish
 ```
 
 ---
@@ -1003,14 +937,16 @@ The agent maintains persistent state in `.ai/` at the repository root. This dire
 │   ├── last_session.md        ← read on startup, written at end of session
 │   ├── session_counter.txt
 │   ├── task_state.json        ← structured working memory, survives interruption
-│   └── external_messages.md  ← external inbox, read and cleared on startup
+│   ├── external_messages.md  ← external inbox, read and cleared on startup
+│   ├── checkpoints.md         ← mid-task progress notes from checkpoint tool
+│   └── session_decisions.md   ← per-step decision annotations from LLM actions
 ├── logs/
 │   ├── history.md
-│   ├── session-NNN.md         ← per-session markdown report, including path-sensitivity summary when relevant
-│   └── session-NNN.trace.json ← structured session trace (start, turns, finish, path-sensitivity diagnostics)
+│   ├── session-NNN.md         ← per-session markdown report
+│   └── session-NNN.trace.json ← structured session trace
 └── knowledge/                 ← agent-written project knowledge
-    ├── lessons_learned.md     ← QA appends project-specific patterns after each session
-    ├── decisions.md           ← Boss/Developer log architectural decisions + rationale
+    ├── lessons_learned.md     ← QA appends patterns after each session
+    ├── decisions.md           ← Boss/Developer log architectural decisions
     └── qa_report.md           ← latest test run
 ```
 
@@ -1020,42 +956,32 @@ The agent maintains persistent state in `.ai/` at the repository root. This dire
 
 **`task_state.json`** — structured working memory persisted across interruptions. Restored at the start of the next session when it contains a resume-worthy goal or action history. Cleared on successful completion, kept on error or no-progress stop.
 
-**`session-NNN.md`** — per-session markdown report written under `.ai/logs/`. It includes task, summary, tool usage, and a `Path sensitivity` section when the session touched config, prompts, repo metadata, or other tagged path categories.
+**`session-NNN.md`** — per-session markdown report. Includes task, summary, tool usage, and a `Path sensitivity` section when the session touched config, prompts, or other tagged path categories.
 
-**`session-NNN.trace.json`** — structured session trace written under `.ai/logs/`. Besides start/turn/finish events and per-tool call counts, it now records aggregated `path_sensitivity_stats` and embeds per-turn sensitivity hints when tool outputs include `[sensitivity: ...]`.
+**`session-NNN.trace.json`** — structured session trace with start/turn/finish events, per-tool call counts, aggregated `path_sensitivity_stats`, and per-turn sensitivity hints.
 
-**Final session summary** — the plain-text close-out printed at the end of a run now includes a compact `Safety : ...` line when path-sensitive writes occurred, so the operator sees the same signal immediately without opening saved artifacts.
+**`session_decisions.md`** — the LLM can include a `decision` field in its JSON actions. These are automatically appended here per step — zero cost, no extra tool call needed.
 
-**Redaction** — before any text is written to `session-NNN.md`, `session-NNN.trace.json`, or `last_session.md`, the task description and final summary pass through a central redaction filter (`src/redaction.rs`). The filter replaces any line that contains a known sensitive token pattern with `[redacted]`. The same filter is applied to the output strings of all write-oriented tools (`write_file`, `str_replace`, `str_replace_multi`, `str_replace_fuzzy`, `memory_write`, `memory_delete`) before they are returned to the agent. Path-sensitivity annotations such as `[sensitivity: project_config]` are intentionally preserved — they do not match any sensitive-token pattern.
+**Redaction** — before any text is written to `session-NNN.md`, `session-NNN.trace.json`, or `last_session.md`, the task description and final summary pass through `src/redaction.rs`. The filter replaces lines containing known sensitive token patterns with `[redacted]`. The same filter is applied to write-oriented tool outputs before they are returned to the agent.
 
-Covered patterns: PEM key headers (`-----BEGIN `), common API key prefixes (`sk-`, `ghp_`, `ghs_`, `glpat-`, `xoxb-`, `xoxp-`), HTTP auth headers (`Authorization: Bearer `, `Authorization: Basic `), and common env-var-style assignments (`password=`, `passwd=`, `secret=`, `api_key=`, `apikey=`, `access_token=`, `refresh_token=`, `private_key=`).
+Covered patterns: PEM key headers, common API key prefixes (`sk-`, `ghp_`, `ghs_`, `glpat-`, `xoxb-`, `xoxp-`), HTTP auth headers, and common env-var-style assignments (`password=`, `secret=`, `api_key=`, `access_token=`, etc.).
 
-Intentionally not redacted: read-tool output (the agent needs file and memory content to act), subprocess stdout/stderr from `run_command` and git tools (compiler errors, test output), and HTTP response bodies from `fetch_url` / `github_api`. These are ephemeral in the LLM context window and not persisted to on-disk artifacts by the agent runtime.
+**`external_messages.md`** — your inbox for the agent. Write anything here before a run; the agent sees it on startup and the file is cleared.
 
-**`external_messages.md`** — your inbox for the agent. Write anything here before a run; the agent will see it on startup and the file is cleared. Use this for instructions that don't fit as a `--task` flag, or to send notes from an external process.
+**`project.toml`** — permanent project context injected every session.
 
-**`project.toml`** — permanent project context injected every session. Commands for test/build/lint, GitHub repo name, agent conventions. Edit once, used forever.
+**`lessons_learned.md`** — QA appends project-specific anti-patterns after each session.
 
-**`lessons_learned.md`** — QA appends project-specific anti-patterns and correct approaches after each session. The agent reads this before starting work to avoid repeating mistakes.
-
-**`decisions.md`** — Boss and Developer log significant architectural decisions: what was chosen, what alternatives were considered, and why. Consulted before redesigning anything.
-
-**`review_report.md`** — Reviewer writes a structured static analysis after each review session: architectural issues, code smells, convention violations, potential bugs, with per-finding severity ratings.
+**`decisions.md`** — Boss and Developer log significant architectural decisions.
 
 ### Global memory — `~/.do_it/`
 
-Two files in `~/.do_it/` persist across all projects. The `boss` role reads them automatically at the start of every session (if they contain actual content, not just the default comments).
-
 | File | Key | Purpose |
 |---|---|---|
-| `user_profile.md` | `user_profile` | Your preferences: communication language, tech stack, preferred crates, workflow style. Edit once, applies to all projects. |
-| `boss_notes.md` | `boss_notes` | Cross-project insights the Boss accumulates — patterns that work, approaches to avoid, ideas for future projects. |
+| `user_profile.md` | `user_profile` | Your preferences: language, tech stack, workflow style. Edit once, applies to all projects. |
+| `boss_notes.md` | `boss_notes` | Cross-project insights the Boss accumulates. |
 
-Boss reads these files and appends to them over time:
-- When it learns something stable about you → updates `user_profile` via `memory_write("user_profile", ...)`
-- When it discovers a cross-project insight → appends to `boss_notes` via `memory_write("boss_notes", ..., append=true)`
-
-Both files are created with commented templates on first run. They are only injected into context when they contain actual content (not just `#` comment lines).
+Both files are only injected into context when they contain actual content (not just `#` comment lines).
 
 ---
 
@@ -1065,38 +991,31 @@ Both files are created with commented templates on first run. They are only inje
 
 **`find_files`** — simple patterns only: `*.rs`, `test*`, substring. No `**`, `{a,b}`, or `?`.
 
-**`run_command`** — no `|`, `&&`, `>`. Each command is a separate call with an explicit args array.
-
-Current policy hardening:
-- `program` must be a bare executable name from `PATH`, not `./tool` or `C:\path\tool.exe`
-- timeout is required to stay within the tool's max bound
-- arg count / arg length are capped
-- env var count / value length are capped
-- risky env overrides such as `PATH`, `PATHEXT`, `COMSPEC`, `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `RUSTC_WRAPPER`, `CARGO_HOME`, `RUSTUP_HOME`, `HOME`, and `USERPROFILE` are rejected
+**`run_command`** — no `|`, `&&`, `>`. Each command is a separate call with an explicit args array. Policy hardening: `program` must be a bare executable name from `PATH`; risky env overrides (`PATH`, `PATHEXT`, `LD_PRELOAD`, `CARGO_HOME`, etc.) are rejected; arg count/length and env var count/length are capped.
 
 **`run_targeted_test`** — currently optimized for Rust repositories. Node/Python fallback branches are intentionally deferred.
 
 **`format_changed_files_only`** — currently optimized for Rust repositories and relies on `git` + `rustfmt` being available.
 
-**`apply_patch_preview`** — preview-only helper. It intentionally does not edit files; follow with `str_replace` or `write_file` for the real change.
+**`apply_patch_preview`** — preview-only helper. Follow with `str_replace` or `write_file` for the real change.
 
-**`run_script`** — intentionally narrow. It is for small parsing/inspection tasks, not general-purpose program execution.
+**`str_replace_fuzzy`** — experimental whitespace-tolerant variant of `str_replace`. Graduation criteria documented in `src/tools/spec.rs`.
 
-**`fetch_url`** — public URLs only, no authentication, no JavaScript rendering. For GitHub use `raw.githubusercontent.com`.
+**`run_script`** — intentionally narrow. For small parsing/inspection tasks, not general-purpose program execution.
 
-**`web_search`** — DuckDuckGo HTML endpoint, no API key required. Rate limiting possible under heavy use.
+**`fetch_url`** — public URLs only, no authentication, no JavaScript rendering.
+
+**`web_search`** — DuckDuckGo HTML endpoint (DOM-parsed via `scraper` crate), no API key required. Rate limiting possible under heavy use.
 
 **Code intelligence** — tree-sitter backend covers ~95% of real-world cases. Does not handle macros, conditional compilation, or dynamically generated code.
 
-**`test_coverage`** — implemented for Rust projects. Coverage numbers depend on `cargo llvm-cov` or `cargo tarpaulin`; without those tools it falls back to `cargo test` and reports that coverage is unavailable.
+**`test_coverage`** — implemented for Rust projects. Prefers `cargo llvm-cov`, falls back to `cargo tarpaulin`, then `cargo test` (no coverage numbers).
 
-**Vision** — image input is implemented and tested. GGUF files in Ollama may not include the mmproj component for vision models. Use llama.cpp directly or verify your model has vision support.
+**Vision** — image input is implemented. GGUF files in Ollama may not include the mmproj component. Use llama.cpp directly or verify your model has vision support.
 
-**`spawn_agent` / `spawn_agents`** — implemented and tested. The main practical limit is step budget and model quality, not a stubbed runtime.
+**`spawn_agents`** — executes sub-agents.
 
-**`memory_write`** — supports `append=true` and namespaced keys (`knowledge/decisions`, `knowledge/qa_report`, etc.) via subdirectory layout in `.ai/memory/`.
-
-**`memory_delete`** — removes a memory entry by key. Available to `boss` and `memory` roles.
+**`validate_runtime()`** — checks Ollama model reachability. Non-Ollama backends log a warning instead of probing models (no standard list endpoint).
 
 ---
 
@@ -1116,6 +1035,7 @@ do_it run --task "Plan the auth module refactor"          --role boss
 
 ```bash
 git status              # start from a clean working tree
+do_it check             # validate config and workspace
 do_it config            # verify resolved config — check llm_url, llm_backend, model
 ```
 
@@ -1133,8 +1053,6 @@ do_it run --task "In src/lexer.rs the tokenize function returns an empty Vec \
 do_it run --task tasks/issue-42.md --role developer
 ```
 
-A task file can include reproduction steps, logs, expected vs actual behaviour, and any relevant constraints.
-
 ### Project-specific role prompts
 
 ```bash
@@ -1150,20 +1068,18 @@ EOF
 
 ### Using GitHub API
 
-Set `GITHUB_TOKEN` in your environment (classic token with `repo` scope is sufficient):
-
 ```bash
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxx
 do_it run --task "Find all open bugs and fix the highest priority one" --role developer
 ```
 
-The agent can list issues, read them, post comments, create PRs, and read file contents directly from GitHub — useful when working across repositories.
-
 ---
 
 ## Troubleshooting
 
-**`Tool 'X' is not allowed for role 'Y'`** — the model tried to use a tool outside the role's allowlist. Either switch to `--role default` or add the tool to `.ai/prompts/<role>.md` with an explicit mention.
+**`do_it check failed`** — run `do_it check` to see which check failed. Typical causes: invalid `config.toml`, unreachable Ollama URL, missing `.ai/` workspace.
+
+**`Tool 'X' is not allowed for role 'Y'`** — the model tried to use a tool outside the role's allowlist. Either switch to `--role default` or add the tool to `.ai/prompts/<role>.md`.
 
 **`Cannot reach LLM service`** — check that `llm_url` is correct and the service is running:
 ```bash
@@ -1171,7 +1087,7 @@ The agent can list issues, read them, post comments, create PRs, and read file c
 ollama serve
 curl http://localhost:11434/api/tags
 
-# OpenAI-compatible — check the URL and port
+# OpenAI-compatible
 curl http://localhost:20128/v1/models
 ```
 
@@ -1183,36 +1099,31 @@ ollama list
 
 **`HTTP 401 Unauthorized`** — API key missing or wrong. Set `llm_api_key` in `config.toml` or the `LLM_API_KEY` environment variable.
 
-**`HTTP 404` on chat endpoint** — `llm_url` may include an extra path. Use the base URL only — the protocol suffix (`/v1/chat/completions` for OpenAI, `/api/chat` for Ollama, `/v1/messages` for Anthropic) is appended automatically. For example use `https://api.openai.com`, not `https://api.openai.com/v1`.
+**`HTTP 404` on chat endpoint** — `llm_url` may include an extra path. Use the base URL only; the protocol suffix is appended automatically (`/v1/chat/completions` for OpenAI, `/api/chat` for Ollama, `/v1/messages` for Anthropic).
 
-**`LLM response has no JSON`** — the model responded outside of JSON format. Try a larger model, set `temperature = 0.0`, or use a role to reduce the tool count.
+**`LLM response has no JSON`** — the model responded outside JSON format. Try a larger model, set `temperature = 0.0`, or use a role to reduce the tool count.
 
-**`str_replace: old_str found N times`** — provide more context to make `old_str` unique:
-```json
-{ "old_str": "fn process(x: i32) -> i32 {\n    x + 1", "new_str": "..." }
-```
+**`str_replace: old_str found N times`** — provide more context to make `old_str` unique.
 
-**`ask_human via Telegram: no reply received within 5 minutes`** — verify the bot token and chat_id, and that you have sent `/start` to the bot. The agent continues with an error and falls back to console.
+**`ask_human via Telegram: no reply received within 5 minutes`** — verify the bot token and chat_id, and that you have sent `/start` to the bot.
 
 **`fetch_url: HTTP 403` or empty result** — the site blocks bots or requires JavaScript. Use direct API endpoints: `raw.githubusercontent.com` instead of `github.com`.
 
 **`github_api: no token found`** — set `GITHUB_TOKEN` environment variable or pass `"token"` in args.
 
-**`test_coverage: coverage backend not found`** — install `cargo-llvm-cov` or `cargo-tarpaulin`. Without them, the tool falls back to `cargo test` and reports that coverage numbers are unavailable.
+**`test_coverage: coverage backend not found`** — install `cargo-llvm-cov` or `cargo-tarpaulin`.
 
-**`run_script` failed or timed out** — reduce the script size, avoid heavy loops, and keep it to parsing/transform tasks. For broader automation, prefer a dedicated Rust tool or `run_command`.
+**`run_script` failed or timed out** — reduce the script size and keep it to parsing/transform tasks.
 
-**`run_command` rejects a program or env override** — this is usually intentional policy enforcement, not a runtime bug. Use a bare executable name from `PATH`, keep `timeout_secs` modest, and avoid overriding blocked environment keys.
+**`run_command` rejects a program or env override** — use a bare executable name from `PATH`, keep `timeout_secs` modest, and avoid overriding blocked environment keys.
 
-**`run_targeted_test` only reports Rust support** — this is expected right now. The helper is intentionally Rust-first; Node/Python fallbacks are tracked as later follow-up work.
+**`apply_patch_preview` says `old_str` is missing or not unique** — mirrors `str_replace` rules on purpose.
 
-**`format_changed_files_only` finds nothing to do** — it only formats changed `.rs` files visible to `git status`. If the repo is not a git repo or only non-Rust files changed, the no-op result is expected.
+**Agent is looping** — the runtime injects `Working Memory` and `Strategy Notes` to reduce repeated weak-tool calls, but loops are still possible. Reduce `history_window`, restart with a more specific task, or use a larger model.
 
-**`apply_patch_preview` says `old_str` is missing or not unique** — this mirrors `str_replace` rules on purpose, so the preview stays honest about whether the eventual targeted edit is safe.
+**Sub-agent stuck** — limited by `max_steps`. Pass a smaller `max_steps` explicitly, or break the task into smaller pieces.
 
-**Agent is looping** — the runtime now injects `Working Memory` and `Strategy Notes` to reduce repeated weak-tool calls, but loops are still possible. Reduce `history_window`, restart with a more specific task, or use a larger model if needed.
-
-**Sub-agent stuck** — if `spawn_agent` takes too long, the sub-agent is limited by `max_steps`. Pass a smaller `max_steps` explicitly, or break the task into smaller pieces.
+**Browser tool errors** — verify `[browser]` config and that the AWP server is running and accepting WebSocket connections at `awp_url`. Browser tools are experimental; connection and protocol errors are surfaced directly.
 
 ---
 
@@ -1220,7 +1131,7 @@ ollama list
 
 ```
 do_it/
-├── Cargo.toml           name="do_it", edition="2021", version="0.3.2"
+├── Cargo.toml           name="do_it", edition="2021", version="0.3.3"
 ├── config.toml          runtime configuration (models, Telegram, [browser])
 ├── README.md            project overview
 ├── DOCS.md              this file
@@ -1230,58 +1141,57 @@ do_it/
 │   ├── project.toml     project config (auto-scaffolded)
 │   ├── prompts/         custom role prompts
 │   ├── state/           plan, last_session, session_counter, task_state, external_messages
-│   ├── logs/            history.md
+│   ├── logs/            history.md, per-session reports and traces
 │   ├── screenshots/     browser tool output (PNG files)
-│   └── knowledge/       lessons_learned, decisions, qa_report, review_report, sub-agent results
+│   └── knowledge/       lessons_learned, decisions, qa_report, sub-agent results
 └── src/
-    ├── main.rs              bin wrapper — calls start::run()
-    ├── start.rs             CLI: run | config | roles; --role flag; image detection
+    ├── main.rs              bin wrapper
+    ├── start.rs             CLI: run | init | check | config | roles | status
+    ├── start/
+    │   ├── init.rs
+    │   ├── check.rs         do_it check
+    │   ├── run_support.rs
+    │   ├── shared.rs
+    │   ├── status.rs        do_it status
+    │   └── tests.rs
     ├── lib.rs               library root for integration tests
-    ├── agent/               agent module (replaces agent_core/loop/tools)
-    │   ├── mod.rs           pub use core::{SweAgent, StepOutcome}
+    ├── agent/
+    │   ├── mod.rs
     │   ├── core.rs          SweAgent struct and all field accessors
-    │   ├── tools.rs         parse_action, first_line, format_args_display, project detection
-    │   ├── session.rs       session_init/finish, task_state persistence, resume logic
-    │   ├── prompt.rs        build_prompt, build_strategy_notes, detect_loop
-    │   ├── display.rs       console/TUI output helpers, boss task-source enforcement
-    │   ├── spawn.rs         spawn_agent, spawn_agents, TUI sender bridge
-    │   └── loops         
-    │       ├── mod.rs       run(), run_capture(), step(), loop entry points
-    │       └── tests.rs     loops tests
+    │   ├── tools.rs         parse_action, LLM action helpers
+    │   ├── session/         session_init/finish, task_state persistence, resume logic
+    │   ├── prompt.rs        build_prompt, strategy_notes, loop detection
+    │   ├── display.rs       console/TUI output helpers
+    │   ├── spawn.rs         spawn_agent, spawn_agents
+    │   └── loops/
+    │       ├── mod.rs         run(), run_capture(), step()
+    │       └── tests.rs
     ├── config_struct.rs     AgentConfig, BrowserConfig, Role enum, model router, built-in prompts
     ├── config_loader.rs     config loading, global config bootstrap, prompt overrides
     ├── config_validation.rs runtime and static config validation
     ├── history.rs           sliding window context manager
-    ├── task_state.rs        structured working memory for goal/actions/artifacts/blockers
-    ├── loop_policy.rs       loop/stall detection thresholds and signal functions
-    ├── redaction.rs         central redaction filter — scrubs sensitive tokens from artifact strings
-    ├── shell.rs             LLM client: Ollama / OpenAI / Anthropic backends, BackendConfig, LlmClient
-    ├── tui.rs               Ratatui TUI: three-panel live view, prompt widget, panic hook
-    ├── validation.rs        path traversal protection and safe path resolution
-    ├── tools/               runtime tools split by domain
-    │   ├── core.rs          central dispatch (dispatch_with_depth) and shared helpers
-    │   ├── spec.rs          tool registry: names, aliases, roles, status, prompt metadata
-    │   ├── file_ops.rs      read_file, write_file, str_replace, apply_patch_preview, list_dir, find_files, search_in_files
-    │   ├── commands.rs      run_command, run_targeted_test, format_changed_files_only
-    │   ├── web.rs           web_search, fetch_url, github_api
-    │   ├── human.rs         ask_human (TUI + Telegram), notify
-    │   ├── memory.rs        memory_read, memory_write, memory_delete (namespaced keys)
-    │   ├── code_analysis.rs get_symbols, outline, get_signature, find_references
-    │   ├── git.rs           git_status, git_commit, git_log, git_stash, git_pull, git_push
-    │   ├── browser.rs       screenshot, browser_get_text, browser_action, browser_navigate
-    │   ├── workspace.rs     tree, project_map, find_entrypoints, trace_call_path, diff_repo
-    │   ├── background.rs    run_background, process_status, process_list, process_kill
-    │   ├── scripting.rs     run_script (Rhai sandbox)
-    │   └── test_coverage.rs test_coverage with cargo llvm-cov / tarpaulin fallback
-    └── prompts/             built-in role prompts compiled into the binary via include_str!
-        ├── default.md
-        ├── boss.md          orchestrator — memory, spawn, never writes code directly
-        ├── developer.md
-        ├── navigator.md
-        ├── qa.md
-        ├── reviewer.md
-        ├── research.md
-        └── memory.md
+    ├── task_state.rs        structured working memory
+    ├── loop_policy.rs       loop/stall detection thresholds
+    ├── redaction.rs         central redaction filter
+    ├── shell.rs             LLM client: Ollama / OpenAI / Anthropic backends
+    ├── tui.rs               Ratatui TUI: three-panel live view, prompt widget
+    ├── validation.rs        path traversal protection
+    └── tools/
+        ├── core.rs          central dispatch (dispatch_with_depth)
+        ├── spec.rs          tool registry: names, aliases, roles, status, prompt metadata
+        ├── file_ops.rs      read_file, write_file, str_replace, apply_patch_preview, ...
+        ├── commands.rs      run_command, run_targeted_test, format_changed_files_only
+        ├── web.rs           web_search (scraper), fetch_url, github_api
+        ├── human.rs         ask_human (TUI + Telegram), notify
+        ├── memory.rs        memory_read, memory_write, memory_delete
+        ├── code_analysis.rs get_symbols, outline, get_signature, find_references
+        ├── git.rs           git_status, git_commit, git_log, git_stash, git_pull, git_push
+        ├── browser.rs       screenshot, browser_get_text, browser_action, browser_navigate (AWP)
+        ├── workspace.rs     tree, project_map, find_entrypoints, trace_call_path, diff_repo
+        ├── background.rs    run_background, process_status, process_list, process_kill
+        ├── scripting.rs     run_script (Rhai sandbox)
+        ├── cleanup.rs       log rotation, stale background pid cleanup
+        └── test_coverage.rs test_coverage with cargo llvm-cov / tarpaulin fallback
 ```
 
 Global config at `~/.do_it/` (created on first run):
@@ -1295,6 +1205,10 @@ Global config at `~/.do_it/` (created on first run):
 └── tool_wishlist.md     agent-requested capabilities — review to prioritise dev work
 ```
 
+### Tool registry and prompt sync
+
+The canonical registry is `src/tools/spec.rs`. It defines canonical names, aliases, role availability, dispatch kind, and capability status. Runtime dispatch lives in `src/tools/core.rs`. Role prompt catalogs are injected from the registry at runtime — they do not drift independently.
+
 ### Dependencies
 
 | Crate | Purpose |
@@ -1305,7 +1219,12 @@ Global config at `~/.do_it/` (created on first run):
 | `toml` | config.toml / project.toml parsing |
 | `clap` | CLI argument parsing |
 | `walkdir` | recursive filesystem traversal |
-| `regex` | search_in_files, find_references, AST parsers |
+| `regex` | search_in_files, find_references, parsers |
 | `base64` | image encoding for vision; GitHub file contents decoding |
 | `anyhow` | error handling |
 | `tracing` / `tracing-subscriber` | structured logging |
+| `scraper` | DOM parsing for web_search HTML extraction |
+| `tree-sitter` | code intelligence backend |
+| `rhai` | run_script sandboxed scripting |
+| `ratatui` / `crossterm` | terminal UI |
+| `plasmate` / AWP | browser automation via AWP WebSocket protocol (session lifecycle: hello → create → commands → close) |

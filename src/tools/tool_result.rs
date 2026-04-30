@@ -40,33 +40,9 @@ impl ToolResult<String> {
     }
 }
 
-/// Create a success ToolResult.
-pub fn success_result(output: String) -> ToolResult<String> {
-    ToolResult::ok(output)
-}
-
-/// Create an error ToolResult.
-pub fn error_result(output: String) -> ToolResult<String> {
-    ToolResult::failure(output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_success_result() {
-        let result = success_result("ok".to_string());
-        assert!(result.success);
-        assert_eq!(result.output, "ok");
-    }
-
-    #[test]
-    fn test_error_result() {
-        let result = error_result("failed".to_string());
-        assert!(!result.success);
-        assert_eq!(result.output, "failed");
-    }
 
     #[test]
     fn test_into_anyhow_success() {

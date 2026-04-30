@@ -379,7 +379,7 @@ fn repeated_malformed_action_failures_bail_early() {
         Err(err) => err,
     };
 
-    assert!(err.to_string().contains("consecutive malformed actions"));
+    assert!(err.to_string().contains("llm_malformed_action"));
     assert_eq!(agent.consecutive_parse_failures(), 2);
 }
 
@@ -514,4 +514,428 @@ fn consecutive_parse_failures_reset_to_zero_after_successful_parse() {
 
     assert!(matches!(outcome, StepOutcome::Continue));
     assert_eq!(agent.consecutive_parse_failures(), 1);
+}
+
+// ─── is_affirmative_response ──────────────────────────────────────────────────
+//
+// These tests pin the exact set of accepted and rejected inputs.
+// is_affirmative_response is called in both run() and run_capture() to decide
+// whether the agent continues after a human escalation. A regression here
+// (e.g. accidentally accepting "no", or dropping "да") would silently change
+// agent behaviour under error conditions.
+
+#[test]
+fn affirmative_response_accepts_all_documented_forms() {
+    // Every string listed in the function's doc comment must be accepted.
+    for input in &[
+        "yes", "YES", "Yes",
+        "y", "Y",
+        "да", "ДА", "Да",
+        "д", "Д",
+        "continue", "Continue", "CONTINUE",
+        "ok", "OK", "Ok",
+        "продолжай", "ПРОДОЛЖАЙ",
+        "proceed", "Proceed", "PROCEED",
+        "go", "GO", "Go",
+    ] {
+        assert!(
+            is_affirmative_response(input),
+            "is_affirmative_response({input:?}) must return true"
+        );
+    }
+}
+
+#[test]
+fn affirmative_response_accepts_inputs_with_surrounding_whitespace() {
+    // The function trims before matching; whitespace variants must be accepted.
+    for input in &["  yes  ", "\tyes\n", " да ", " ok\n"] {
+        assert!(
+            is_affirmative_response(input),
+            "is_affirmative_response({input:?}) with whitespace must return true"
+        );
+    }
+}
+
+#[test]
+fn affirmative_response_rejects_negative_and_ambiguous_inputs() {
+    // None of these should be accepted — any false positive would make the
+    // agent continue despite a negative or unclear human response.
+    for input in &[
+        "no", "NO", "No",
+        "n", "N",
+        "нет", "нет.",
+        "maybe", "perhaps", "later",
+        "stop", "exit", "quit",
+        "", "   ",
+        "yes please",   // extra word — not an exact match
+        "yep",
+        "sure",
+    ] {
+        assert!(
+            !is_affirmative_response(input),
+            "is_affirmative_response({input:?}) must return false"
+        );
+    }
+}
+
+// ─── suppress_human_escalation_for_error ─────────────────────────────────────
+//
+// suppress_human_escalation_for_error controls whether the 2-consecutive-errors
+// threshold triggers ask_human. If a regression makes it return true for a
+// non-suppressed error, the agent silently swallows real failures without asking
+// the human. If it returns false for a suppressed error, the boss floods the
+// human with policy-violation noise.
+
+#[test]
+fn suppress_escalation_always_suppresses_stopped_by_user() {
+    // "Stopped by user" must be suppressed regardless of role, because the
+    // stop was intentional and asking the human is redundant.
+    for role in &["boss", "developer", "reviewer", "planner"] {
+        assert!(
+            suppress_human_escalation_for_error(role, "Stopped by user at step 3"),
+            "role={role}: 'Stopped by user' must always suppress escalation"
+        );
+    }
+}
+
+#[test]
+fn suppress_escalation_suppresses_boss_policy_violations() {
+    // These error messages are produced by Boss policy checks. They are
+    // internal invariant violations — asking the human is not useful.
+    let boss_policy_errors = [
+        "Boss must first delegate",
+        "Boss must process the authoritative task source",
+        "Boss cannot finish before processing",
+        "before asking the human",
+    ];
+    for msg in &boss_policy_errors {
+        assert!(
+            suppress_human_escalation_for_error("boss", msg),
+            "boss: policy error {msg:?} must suppress escalation"
+        );
+    }
+}
+
+#[test]
+fn suppress_escalation_does_not_suppress_boss_policy_violations_for_other_roles() {
+    // Boss policy messages must NOT suppress escalation for non-boss roles.
+    // Those roles may legitimately encounter similar text in tool output.
+    let boss_policy_errors = [
+        "Boss must first delegate",
+        "Boss must process the authoritative task source",
+        "Boss cannot finish before processing",
+        "before asking the human",
+    ];
+    for role in &["developer", "reviewer", "planner"] {
+        for msg in &boss_policy_errors {
+            assert!(
+                !suppress_human_escalation_for_error(role, msg),
+                "role={role}: boss policy message must NOT suppress escalation for non-boss role"
+            );
+        }
+    }
+}
+
+#[test]
+fn suppress_escalation_does_not_suppress_generic_tool_errors() {
+    // Ordinary tool failures must not be suppressed — the human should be
+    // asked whether to continue after two consecutive failures.
+    let generic_errors = [
+        "file not found: src/lib.rs",
+        "permission denied",
+        "network timeout",
+        "JSON parse error",
+        "llm_malformed_action: model failed twice",
+    ];
+    for role in &["boss", "developer"] {
+        for msg in &generic_errors {
+            assert!(
+                !suppress_human_escalation_for_error(role, msg),
+                "role={role}: generic error {msg:?} must NOT suppress escalation"
+            );
+        }
+    }
+}
+
+// ─── await_or_stop ────────────────────────────────────────────────────────────
+//
+// await_or_stop is the single cancellation point for all blocking agent
+// operations: LLM calls, tool dispatch, ask_human. If it regresses (e.g. the
+// stop check is removed or the select! arms are swapped), the Stop button
+// silently stops working — the agent continues until the Future resolves
+// naturally, which may be minutes later (or never, for hung LLM calls).
+//
+// The tests below are async (tokio::test) because await_or_stop is an async
+// function and uses tokio::select! internally.
+
+#[tokio::test]
+async fn await_or_stop_returns_error_when_stop_flag_is_already_set() {
+    // If AtomicBool is true before await_or_stop is called, the function must
+    // return Err("Stopped by user") and not return a successful result.
+    //
+    // The Future passed here never completes on its own (std::future::pending).
+    // Therefore the only way for await_or_stop to return at all is via the
+    // stop_future arm inside the select! — which is exactly what we are testing.
+    //
+    // Note: tokio::select! without `biased` chooses ready arms randomly on the
+    // first poll. Using pending() as the main future ensures it is never ready,
+    // so stop_future is always the one that resolves.
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(true));
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        await_or_stop(Some(flag), std::future::pending::<Result<i32>>()),
+    )
+    .await
+    .expect("await_or_stop must return within 2s when stop flag is already set");
+
+    assert!(result.is_err(), "must return Err when stop flag is set");
+    assert!(
+        result.unwrap_err().to_string().contains("Stopped by user"),
+        "error message must contain 'Stopped by user'"
+    );
+}
+
+#[tokio::test]
+async fn await_or_stop_completes_normally_when_stop_flag_is_not_set() {
+    // When AtomicBool stays false the Future must run to completion and its
+    // Ok value must be returned unchanged.
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(false));
+
+    let fut = async { Ok::<i32, anyhow::Error>(99) };
+
+    let result = await_or_stop(Some(flag), fut).await;
+    assert!(result.is_ok(), "must return Ok when stop flag is not set");
+    assert_eq!(result.unwrap(), 99);
+}
+
+#[tokio::test]
+async fn await_or_stop_completes_normally_when_no_stop_handle() {
+    // None means "no stop handle" — the Future must run to completion without
+    // any cancellation check. This is the sub-agent path where no TUI is
+    // attached.
+    let fut = async { Ok::<&str, anyhow::Error>("done") };
+
+    let result = await_or_stop(None, fut).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), "done");
+}
+
+#[tokio::test]
+async fn await_or_stop_propagates_future_error_when_stop_flag_is_not_set() {
+    // If the Future itself returns Err (e.g. a tool error), that Err must be
+    // forwarded unchanged. It must NOT be confused with a "Stopped by user" error.
+    use std::sync::atomic::AtomicBool;
+
+    let flag = Arc::new(AtomicBool::new(false));
+
+    let fut = async { anyhow::bail!("tool_error: something went wrong") };
+
+    let result = await_or_stop::<(), _>(Some(flag), fut).await;
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(
+        msg.contains("tool_error"),
+        "Future's own error must be forwarded, got: {msg}"
+    );
+    assert!(
+        !msg.contains("Stopped by user"),
+        "must not be misidentified as stop, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn await_or_stop_stops_when_flag_is_set_during_execution() {
+    // The stop flag is set from a background task while await_or_stop is
+    // already running. The function must detect it (within the 100ms polling
+    // interval) and return Err before the slow Future completes.
+    //
+    // The Future sleeps for 10 seconds; the stop flag is set after 50ms.
+    // We give the test a 2-second budget — well above the 100ms poll interval
+    // but far below the 10-second Future duration.
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_setter = Arc::clone(&flag);
+
+    // Set the flag after a short delay so await_or_stop is already inside
+    // the select! loop when the cancellation arrives.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        flag_setter.store(true, Ordering::Relaxed);
+    });
+
+    let slow_future = async {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        Ok::<i32, anyhow::Error>(0)
+    };
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        await_or_stop(Some(flag), slow_future),
+    )
+    .await
+    .expect("await_or_stop must return within 2s after stop flag is set");
+
+    assert!(result.is_err(), "must return Err after stop flag is set");
+    assert!(
+        result.unwrap_err().to_string().contains("Stopped by user"),
+        "error must be 'Stopped by user'"
+    );
+}
+
+// ─── handle_parse_failure: MissingJson and UnterminatedJson variants ──────────
+//
+// The production match arm is:
+//   ParseActionErrorKind::MissingJson
+//   | ParseActionErrorKind::UnterminatedJson
+//   | ParseActionErrorKind::InvalidJson => { bail after >= 2 }
+//
+// The existing InvalidJson tests only exercise one arm of the pattern.
+// If MissingJson or UnterminatedJson were accidentally removed from the match,
+// they would fall through unhandled and the bail!() would never be reached —
+// the agent would keep retrying silently instead of terminating.
+//
+// These tests pin the behaviour of the two remaining variants independently.
+
+#[test]
+fn missing_json_first_failure_allows_retry() {
+    // First MissingJson: counter goes to 1, outcome is Continue.
+    // Guards: variant is inside the MissingJson | UnterminatedJson | InvalidJson arm.
+    let mut agent = test_agent(Role::Developer);
+
+    let outcome = handle_parse_failure(
+        &mut agent,
+        ParseActionError::new(
+            ParseActionErrorKind::MissingJson,
+            "No JSON block found in model response",
+        ),
+        "during initial action selection",
+    )
+    .expect("first MissingJson failure must not bail");
+
+    assert!(matches!(outcome, StepOutcome::Continue));
+    assert_eq!(agent.consecutive_parse_failures(), 1);
+}
+
+#[test]
+fn missing_json_second_failure_bails_with_llm_malformed_action() {
+    // Second consecutive MissingJson: counter reaches 2, must bail with
+    // "llm_malformed_action". Guards the bail!() path for MissingJson.
+    let mut agent = test_agent(Role::Developer);
+    agent.set_consecutive_parse_failures(1);
+
+    let err = match handle_parse_failure(
+        &mut agent,
+        ParseActionError::new(
+            ParseActionErrorKind::MissingJson,
+            "No JSON block found in model response",
+        ),
+        "during initial action selection",
+    ) {
+        Ok(_) => panic!("second MissingJson failure must bail"),
+        Err(e) => e,
+    };
+
+    assert!(
+        err.to_string().contains("llm_malformed_action"),
+        "error must contain 'llm_malformed_action', got: {}",
+        err
+    );
+    assert_eq!(agent.consecutive_parse_failures(), 2);
+}
+
+#[test]
+fn unterminated_json_first_failure_allows_retry() {
+    // First UnterminatedJson: counter goes to 1, outcome is Continue.
+    // Guards: variant is inside the MissingJson | UnterminatedJson | InvalidJson arm.
+    let mut agent = test_agent(Role::Developer);
+
+    let outcome = handle_parse_failure(
+        &mut agent,
+        ParseActionError::new(
+            ParseActionErrorKind::UnterminatedJson,
+            "JSON block is not closed — model response was truncated",
+        ),
+        "during initial action selection",
+    )
+    .expect("first UnterminatedJson failure must not bail");
+
+    assert!(matches!(outcome, StepOutcome::Continue));
+    assert_eq!(agent.consecutive_parse_failures(), 1);
+}
+
+#[test]
+fn unterminated_json_second_failure_bails_with_llm_malformed_action() {
+    // Second consecutive UnterminatedJson: counter reaches 2, must bail with
+    // "llm_malformed_action". Guards the bail!() path for UnterminatedJson.
+    let mut agent = test_agent(Role::Developer);
+    agent.set_consecutive_parse_failures(1);
+
+    let err = match handle_parse_failure(
+        &mut agent,
+        ParseActionError::new(
+            ParseActionErrorKind::UnterminatedJson,
+            "JSON block is not closed — model response was truncated",
+        ),
+        "during initial action selection",
+    ) {
+        Ok(_) => panic!("second UnterminatedJson failure must bail"),
+        Err(e) => e,
+    };
+
+    assert!(
+        err.to_string().contains("llm_malformed_action"),
+        "error must contain 'llm_malformed_action', got: {}",
+        err
+    );
+    assert_eq!(agent.consecutive_parse_failures(), 2);
+}
+
+#[test]
+fn mixed_malformed_variants_share_the_same_counter_and_bail_threshold() {
+    // MissingJson followed by UnterminatedJson must share the same counter —
+    // the bail threshold is 2 consecutive malformed actions regardless of
+    // which specific variant triggered each failure.
+    //
+    // This guards against a hypothetical refactor that splits the match arm
+    // into separate arms with independent counters, breaking the intended
+    // "2 consecutive malformed = stop" invariant.
+    let mut agent = test_agent(Role::Developer);
+
+    // First failure: MissingJson — counter → 1, Continue.
+    handle_parse_failure(
+        &mut agent,
+        ParseActionError::new(
+            ParseActionErrorKind::MissingJson,
+            "No JSON block found",
+        ),
+        "step 1",
+    )
+    .expect("first mixed failure (MissingJson) must not bail");
+    assert_eq!(agent.consecutive_parse_failures(), 1);
+
+    // Second failure: UnterminatedJson — counter → 2, must bail.
+    let err = match handle_parse_failure(
+        &mut agent,
+        ParseActionError::new(
+            ParseActionErrorKind::UnterminatedJson,
+            "JSON block is not closed",
+        ),
+        "step 1 re-route",
+    ) {
+        Ok(_) => panic!("second mixed failure (UnterminatedJson) must bail"),
+        Err(e) => e,
+    };
+
+    assert!(
+        err.to_string().contains("llm_malformed_action"),
+        "mixed variants must share the counter and reach the bail threshold, got: {}",
+        err
+    );
+    assert_eq!(agent.consecutive_parse_failures(), 2);
 }

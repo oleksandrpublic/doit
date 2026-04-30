@@ -216,12 +216,21 @@ async fn test_ask_human_uses_question_alias() {
 
 #[tokio::test]
 async fn test_set_tui_callbacks_install_and_clear() {
-    // Install no-op callbacks — must not panic
+    // Install no-op callbacks — must not panic.
+    //
+    // ask_send now returns a oneshot::Receiver instead of Option<String>.
+    // A no-op implementation creates a channel and immediately drops the
+    // sender — ask_human treats a closed receiver as None (no answer).
     do_it::tools::human::set_tui_callbacks(
         Some(Arc::new(|| {})),
         Some(Arc::new(|| {})),
         Some(Arc::new(|_msg: &str| {})),
-        Some(Arc::new(|_prompt: &str, _timeout_secs: u64| None)),
+        Some(Arc::new(|_prompt: &str, _timeout_secs: u64| {
+            let (tx, rx) = tokio::sync::oneshot::channel::<Option<String>>();
+            drop(tx); // immediately closed → ask_human receives RecvError → None
+            rx
+        })),
+        Some(Arc::new(|| {})),
     );
 
     // Verify notify still works with callbacks installed (log channel — no network)
@@ -230,5 +239,5 @@ async fn test_set_tui_callbacks_install_and_clear() {
     assert!(result.success);
 
     // Clear callbacks
-    do_it::tools::human::set_tui_callbacks(None, None, None, None);
+    do_it::tools::human::set_tui_callbacks(None, None, None, None, None);
 }

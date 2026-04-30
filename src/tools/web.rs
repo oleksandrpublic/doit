@@ -72,6 +72,10 @@ pub async fn fetch_url(args: &Value) -> Result<ToolResult> {
         }
     }
 
+    // Rate limiting: placeholder with 0 delay — aligns fetch_url with web_search/github_api
+    // pattern; allows future throttle configuration without structural changes.
+    RateLimiter::limit("fetch_url", 0).await;
+
     // Build HTTP client
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(timeout_ms))
@@ -159,9 +163,8 @@ pub async fn web_search(args: &Value) -> Result<ToolResult> {
         }
     };
 
-    // Rate limiting: wait to prevent overwhelming the search engine
-    let mut rate_limiter = RateLimiter::new(1);
-    rate_limiter.wait().await;
+    // Rate limiting: use the shared global limiter to prevent overwhelming the search engine
+    RateLimiter::limit("web_search", 1).await;
 
     // Fetch search results page
     let client = reqwest::Client::builder()
@@ -172,27 +175,7 @@ pub async fn web_search(args: &Value) -> Result<ToolResult> {
     match client.get(&search_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let html = resp.text().await.unwrap_or_default();
-
-            // Simple extraction: look for title/description patterns
-            // This is a basic scraper; production would use html5ever or scraper crate
-            let mut results: Vec<String> = Vec::new();
-
-            // Extract links and titles from HTML (simplified)
-            for line in html.lines() {
-                if line.contains("<a") && line.contains("href=") {
-                    if let Some(href_start) = line.find("href=\"") {
-                        if let Some(href_end) = line[href_start + 7..].find('"') {
-                            let href = &line[href_start + 7..href_start + 7 + href_end];
-                            if href.starts_with("http") && !href.contains("duckduckgo") {
-                                results.push(href.to_string());
-                            }
-                        }
-                    }
-                }
-                if results.len() >= num_results {
-                    break;
-                }
-            }
+            let results = parse_search_html(&html, num_results, engine);
 
             if results.is_empty() {
                 Ok(ToolResult {
@@ -215,6 +198,28 @@ pub async fn web_search(args: &Value) -> Result<ToolResult> {
             success: false,
         }),
     }
+}
+
+/// Extract HTTP URLs from a raw search-engine HTML response.
+///
+/// Uses the `scraper` crate for proper DOM parsing instead of line-by-line
+/// heuristics. Handles multi-line tags, minified HTML, and attribute ordering
+/// correctly. Degrades gracefully: empty or malformed HTML returns an empty
+/// Vec without panicking.
+pub(crate) fn parse_search_html(html: &str, num_results: usize, engine: &str) -> Vec<String> {
+    use scraper::{Html, Selector};
+
+    let document = Html::parse_document(html);
+    // Selector is infallible for this literal — unwrap is intentional.
+    let selector = Selector::parse("a[href]").unwrap();
+
+    document
+        .select(&selector)
+        .filter_map(|el| el.value().attr("href"))
+        .filter(|href| href.starts_with("http") && !href.contains(engine))
+        .take(num_results)
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Interact with the GitHub REST API.
@@ -297,9 +302,8 @@ pub async fn github_api(args: &Value) -> Result<ToolResult> {
         }
     };
 
-    // Rate limiting: GitHub API has strict rate limits, wait 2 seconds between requests
-    let mut rate_limiter = RateLimiter::new(2);
-    rate_limiter.wait().await;
+    // Rate limiting: use the shared global limiter; GitHub API is strict about burst requests
+    RateLimiter::limit("github_api", 2).await;
 
     let mut req = client.get(&url);
     req = req.header(USER_AGENT, "do_it-agent/1.0");
@@ -431,6 +435,74 @@ mod tests {
             let args = json!({ "query": "test", "engine": "bing" });
             let result = web_search(&args).await;
             assert!(result.is_ok());
+        }
+    }
+
+    mod parse_search_html {
+        use super::*;
+
+        #[test]
+        fn test_empty_html_returns_empty_vec() {
+            let results = parse_search_html("", 10, "duckduckgo");
+            assert!(results.is_empty());
+        }
+
+        #[test]
+        fn test_garbage_html_returns_empty_vec() {
+            let html = "<html><body><p>No links here at all.</p></body></html>";
+            let results = parse_search_html(html, 10, "duckduckgo");
+            assert!(results.is_empty());
+        }
+
+        #[test]
+        fn test_extracts_http_links() {
+            let html = r#"
+<html>
+  <a href="https://example.com/page1">Result 1</a>
+  <a href="https://example.org/page2">Result 2</a>
+</html>
+"#;
+            let results = parse_search_html(html, 10, "duckduckgo");
+            assert_eq!(results.len(), 2);
+            assert!(results[0].contains("example.com"));
+            assert!(results[1].contains("example.org"));
+        }
+
+        #[test]
+        fn test_num_results_limit_is_respected() {
+            let html = r#"
+<html>
+  <a href="https://a.com">A</a>
+  <a href="https://b.com">B</a>
+  <a href="https://c.com">C</a>
+  <a href="https://d.com">D</a>
+</html>
+"#;
+            let results = parse_search_html(html, 2, "duckduckgo");
+            assert_eq!(results.len(), 2);
+        }
+
+        #[test]
+        fn test_engine_urls_are_filtered_out() {
+            let html = r#"<a href="https://duckduckgo.com/nav">nav</a><a href="https://real.com/result">real</a>"#;
+            let results = parse_search_html(html, 10, "duckduckgo");
+            assert_eq!(results.len(), 1);
+            assert!(results[0].contains("real.com"));
+        }
+
+        #[test]
+        fn test_multiline_and_minified_tags() {
+            // Old line-based parser failed on multi-line tags and minified HTML.
+            // scraper handles both correctly.
+            let html = r#"
+<a
+  href="https://multiline.com/page"
+  class="result">Multi-line tag</a><a href="https://minified.com/x">m</a>
+"#;
+            let results = parse_search_html(html, 10, "duckduckgo");
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().any(|r| r.contains("multiline.com")));
+            assert!(results.iter().any(|r| r.contains("minified.com")));
         }
     }
 

@@ -3,6 +3,7 @@ use crate::agent::tools::first_line;
 use crate::history::Turn;
 use crate::loop_policy::is_exploration_tool;
 use crate::tools::{ToolStatus, all_tool_specs, find_tool_spec, tool_status};
+use crate::tools::spec::RUN_SCRIPT_GUIDE;
 
 impl SweAgent {
     pub(crate) fn build_prompt(&self, task: &str, step: usize) -> String {
@@ -71,6 +72,22 @@ impl SweAgent {
             self.max_steps(),
             self.depth()
         ));
+
+        // Inject the Rhai scripting guide for roles that have run_script.
+        // This is the primary source of truth about syntax, host functions,
+        // limits, and usage patterns. Without it the agent only sees the
+        // one-line prompt_line and produces incorrect scripts.
+        let effective_tools = self
+            .role()
+            .allowed_tools_with_groups(&self.cfg_snapshot().tool_groups);
+        let role_has_run_script = effective_tools.contains(&"run_script")
+            || self.role().name() == "default"; // unrestricted role
+        if role_has_run_script {
+            prompt.push_str("\n");
+            prompt.push_str(RUN_SCRIPT_GUIDE);
+            prompt.push('\n');
+        }
+
         prompt
     }
 
@@ -375,17 +392,39 @@ fn suggested_fallbacks(
     unrestricted: bool,
     allowed: &[&'static str],
 ) -> Vec<&'static str> {
-    let same_category = find_tool_spec(canonical_tool)
+    // A candidate tool is considered "accessible" to this role/config when:
+    //   - the role has no restrictions (unrestricted), OR
+    //   - the candidate's allowed_roles includes this role, AND
+    //   - the candidate is actually in the effective allowed list (respects
+    //     optional groups: a Browser tool is only accessible when the browser
+    //     group is enabled in tool_groups).
+    //
+    // The `allowed` slice already reflects both role membership and enabled
+    // groups, so checking `allowed.contains` is the authoritative test.
+    // For unrestricted roles we fall back to allowed_roles membership only
+    // (since allowed is empty in that case).
+    let is_accessible = |candidate: &&'static crate::tools::ToolSpec| -> bool {
+        if candidate.status != crate::tools::ToolStatus::Real {
+            return false;
+        }
+        if unrestricted {
+            candidate.allowed_roles.contains(&role_name)
+        } else {
+            // Must be both in role's allowed_roles AND in the effective
+            // allowed list (i.e. its optional group, if any, is enabled).
+            candidate.allowed_roles.contains(&role_name)
+                && allowed.contains(&candidate.canonical_name)
+        }
+    };
+
+    let same_category: Vec<&'static str> = find_tool_spec(canonical_tool)
         .map(|spec| {
             all_tool_specs()
                 .iter()
                 .filter(|candidate| {
                     candidate.canonical_name != canonical_tool
                         && candidate.prompt_category == spec.prompt_category
-                        && candidate.status == ToolStatus::Real
-                        && (unrestricted
-                            || candidate.allowed_roles.contains(&role_name)
-                            || allowed.contains(&candidate.canonical_name))
+                        && is_accessible(candidate)
                 })
                 .map(|candidate| candidate.canonical_name)
                 .take(3)
@@ -418,12 +457,7 @@ fn suggested_fallbacks(
         .copied()
         .filter(|candidate| {
             find_tool_spec(candidate)
-                .map(|spec| {
-                    spec.status == ToolStatus::Real
-                        && (unrestricted
-                            || spec.allowed_roles.contains(&role_name)
-                            || allowed.contains(&spec.canonical_name))
-                })
+                .map(|spec| is_accessible(&spec))
                 .unwrap_or(false)
         })
         .take(3)
@@ -841,6 +875,44 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_includes_scripting_guide_for_roles_with_run_script() {
+        // developer, navigator, qa have run_script — guide must appear.
+        for (role, name) in [
+            (Role::Developer, "developer"),
+            (Role::Navigator, "navigator"),
+            (Role::Qa, "qa"),
+        ] {
+            let agent = test_agent(role);
+            let prompt = agent.build_prompt("Count lines", 1);
+            assert!(
+                prompt.contains("read_lines"),
+                "role {name}: scripting guide must be injected into prompt"
+            );
+            assert!(
+                prompt.contains("Available host functions"),
+                "role {name}: guide must include host functions section"
+            );
+        }
+    }
+
+    #[test]
+    fn build_prompt_excludes_scripting_guide_for_roles_without_run_script() {
+        // boss, reviewer, research do NOT have run_script — guide must not appear.
+        for (role, name) in [
+            (Role::Boss, "boss"),
+            (Role::Reviewer, "reviewer"),
+            (Role::Research, "research"),
+        ] {
+            let agent = test_agent(role);
+            let prompt = agent.build_prompt("Plan the feature", 1);
+            assert!(
+                !prompt.contains("Available host functions"),
+                "role {name}: scripting guide must NOT be injected"
+            );
+        }
+    }
+
+    #[test]
     fn build_prompt_step1_without_resume_state_has_no_resume_guidance() {
         // When the agent has not been resumed from persisted task state,
         // build_prompt at step 1 must not include a Resume Guidance section.
@@ -871,5 +943,44 @@ mod tests {
         assert!(prompt.contains("### History"));
         assert!(!prompt.contains("### Resume Guidance"));
         assert!(prompt.contains("### Task"));
+    }
+
+    /// Regression: after adding check_awp_server (Real, Browser group) to spec.rs,
+    /// suggested_fallbacks for browser tools incorrectly returned only check_awp_server
+    /// (same category, Real) when the browser group was not enabled — bypassing the
+    /// heuristic fallback list that includes ask_human/notify.
+    ///
+    /// The fix: same_category candidates must be actually accessible (i.e. present in
+    /// the effective allowed list), not just role-members. Group tools are only
+    /// accessible when their group is enabled in tool_groups.
+    #[test]
+    fn strategy_notes_browser_fallbacks_exclude_disabled_group_tools() {
+        // Boss without browser group enabled: check_awp_server must NOT appear
+        // as a fallback for browser_get_text (it's in the disabled Browser group).
+        // ask_human or notify must appear instead (both are core Boss tools).
+        let mut agent = test_agent(Role::Boss);
+        for step in 1..=2 {
+            agent.history_mut().push(Turn {
+                step,
+                thought: "Need rendered page text".to_string(),
+                tool: "browser_get_text".to_string(),
+                args: serde_json::json!({ "url": "https://example.com" }),
+                output: "[experimental tool]\nERR browser connection is not configured".to_string(),
+                success: false,
+            });
+        }
+
+        let notes = agent
+            .build_strategy_notes()
+            .expect("strategy note expected");
+        assert!(notes.contains("`browser_get_text` is experimental"));
+        assert!(
+            notes.contains("`ask_human`") || notes.contains("`notify`"),
+            "expected ask_human or notify in fallbacks, got: {notes}"
+        );
+        assert!(
+            !notes.contains("`check_awp_server`"),
+            "check_awp_server must not appear when browser group is disabled, got: {notes}"
+        );
     }
 }

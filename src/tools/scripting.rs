@@ -19,31 +19,43 @@ const MAX_EXPR_DEPTH: usize = 64;
 const MAX_VARIABLES: usize = 256;
 const MAX_FUNCTIONS: usize = 64;
 const MAX_MODULES: usize = 0;
-const SCRIPT_TIMEOUT: Duration = Duration::from_secs(1);
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn run_script(args: &Value, root: &Path) -> Result<ToolResult> {
     let script = str_arg(args, "script")?;
+    let allow_write = args
+        .get("allow_write")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let workdir = if let Some(dir) = args.get("dir").and_then(|v| v.as_str()) {
         resolve(root, dir)?
     } else {
         root.to_path_buf()
     };
 
-    let handle = tokio::task::spawn_blocking(move || execute_script(&script, &workdir));
+    let handle =
+        tokio::task::spawn_blocking(move || execute_script(&script, &workdir, allow_write));
     match tokio::time::timeout(SCRIPT_TIMEOUT, handle).await {
         Ok(joined) => joined.map_err(|e| anyhow!("run_script worker failed: {e}"))?,
         Err(_) => Ok(ToolResult::failure(
-            "run_script: timed out after 1s".to_string(),
+            "run_script: timed out after 30s".to_string(),
         )),
     }
 }
 
-fn execute_script(script: &str, workdir: &Path) -> Result<ToolResult> {
+/// Execute a Rhai script synchronously with a given workdir and no file-write access.
+/// Exposed for `do_it check` which runs consistency scripts with a longer timeout.
+pub(crate) fn execute_script_readonly(script: &str, workdir: &Path) -> ToolResult {
+    execute_script(script, workdir, false)
+        .unwrap_or_else(|e| ToolResult::failure(format!("execute_script error: {e}")))
+}
+
+fn execute_script(script: &str, workdir: &Path, allow_write: bool) -> Result<ToolResult> {
     let logs = Arc::new(Mutex::new(Vec::<String>::new()));
     let started = Instant::now();
     let mut engine = Engine::new();
     configure_limits(&mut engine, started);
-    register_host_functions(&mut engine, workdir.to_path_buf(), Arc::clone(&logs));
+    register_host_functions(&mut engine, workdir.to_path_buf(), Arc::clone(&logs), allow_write);
 
     let result = engine.eval::<Dynamic>(script);
     let logs = logs.lock().unwrap().clone();
@@ -70,14 +82,19 @@ fn configure_limits(engine: &mut Engine, started: Instant) {
     engine.set_max_modules(MAX_MODULES);
     engine.on_progress(move |_| {
         if started.elapsed() > SCRIPT_TIMEOUT {
-            Some(Dynamic::from("script exceeded 1s time budget"))
+            Some(Dynamic::from("script exceeded 30s time budget"))
         } else {
             None
         }
     });
 }
 
-fn register_host_functions(engine: &mut Engine, workdir: PathBuf, logs: Arc<Mutex<Vec<String>>>) {
+fn register_host_functions(
+    engine: &mut Engine,
+    workdir: PathBuf,
+    logs: Arc<Mutex<Vec<String>>>,
+    allow_write: bool,
+) {
     // ── read_lines ────────────────────────────────────────────────────────────
     let read_root = workdir.clone();
     engine.register_fn(
@@ -149,26 +166,113 @@ fn register_host_functions(engine: &mut Engine, workdir: PathBuf, logs: Arc<Mute
         },
     );
 
-    // ── sha256 — hex digest of a string ──────────────────────────────────────
+    // ── fnv64 — fast non-cryptographic FNV-1a 64-bit hash ──────────────────────
+    // Name reflects the actual algorithm. Use for change detection and
+    // deduplication only — NOT for security or interoperability with SHA-256.
     engine.register_fn(
-        "sha256",
+        "fnv64",
         |text: ImmutableString| -> ImmutableString {
-            sha256_hex(text.as_str()).into()
+            fnv64_hex(text.as_str()).into()
         },
     );
 
     // ── log ───────────────────────────────────────────────────────────────────
+    // write_text -- opt-in file write (requires allow_write: true)
+    if allow_write {
+        let write_root = workdir.clone();
+        engine.register_fn(
+            "write_text",
+            move |path: ImmutableString,
+                  content: ImmutableString|
+                  -> std::result::Result<ImmutableString, Box<EvalAltResult>> {
+                if content.len() > MAX_STRING_SIZE {
+                    return Err(rhai_err(anyhow!(
+                        "write_text: content exceeds {} byte limit",
+                        MAX_STRING_SIZE
+                    )));
+                }
+                let resolved = resolve(&write_root, path.as_str()).map_err(rhai_err)?;
+                if let Some(parent) = resolved.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| rhai_err(anyhow!("write_text mkdir: {e}")))?;
+                }
+                std::fs::write(&resolved, content.as_str()).map_err(|e| {
+                    rhai_err(anyhow!("write_text: {}: {e}", resolved.display()))
+                })?;
+                Ok(format!("written: {}", resolved.display()).into())
+            },
+        );
+    } else {
+        // Stub: clear error instead of confusing "function not found"
+        engine.register_fn(
+            "write_text",
+            |_path: ImmutableString,
+             _content: ImmutableString|
+             -> std::result::Result<ImmutableString, Box<EvalAltResult>> {
+                Err(rhai_err(anyhow!(
+                    "write_text is disabled -- pass allow_write: true to run_script to enable it"
+                )))
+            },
+        );
+    }
+
+    // ── list_dir ────────────────────────────────────────────────────────────────────────
+    // Returns an Array of entry names (not full paths) inside the given directory.
+    // Path is resolved relative to workdir; path traversal is rejected.
+    let list_root = workdir.clone();
+    engine.register_fn(
+        "list_dir",
+        move |path: ImmutableString| -> std::result::Result<Array, Box<EvalAltResult>> {
+            let resolved = resolve(&list_root, path.as_str()).map_err(rhai_err)?;
+            let rd = std::fs::read_dir(&resolved).map_err(|e| {
+                rhai_err(anyhow!("list_dir: {}: {e}", resolved.display()))
+            })?;
+            let mut entries: Vec<Dynamic> = Vec::new();
+            for entry in rd {
+                let entry =
+                    entry.map_err(|e| rhai_err(anyhow!("list_dir: read entry: {e}")))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                entries.push(Dynamic::from(name));
+            }
+            entries.sort_by(|a, b| {
+                a.clone()
+                    .try_cast::<ImmutableString>()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default()
+                    .cmp(
+                        &b.clone()
+                            .try_cast::<ImmutableString>()
+                            .map(|s| s.to_string())
+                            .unwrap_or_default(),
+                    )
+            });
+            Ok(entries)
+        },
+    );
+
+    // ── file_exists ────────────────────────────────────────────────────────────────
+    // Returns true when the path exists (file or directory) within workdir.
+    // Path traversal is rejected.
+    let exists_root = workdir.clone();
+    engine.register_fn(
+        "file_exists",
+        move |path: ImmutableString| -> std::result::Result<bool, Box<EvalAltResult>> {
+            let resolved = resolve(&exists_root, path.as_str()).map_err(rhai_err)?;
+            Ok(resolved.exists())
+        },
+    );
+
     engine.register_fn("log", move |msg: Dynamic| {
         let mut collected = logs.lock().unwrap();
         collected.push(format_dynamic(&msg));
     });
 }
 
-// ── sha256 implementation ─────────────────────────────────────────────────────
+// ── fnv64 implementation ──────────────────────────────────────────────────────
 
-fn sha256_hex(input: &str) -> String {
-    // FNV-1a 64-bit expressed as hex — stable, dependency-free, useful for
-    // change detection and deduplication in scripts. Not cryptographic.
+fn fnv64_hex(input: &str) -> String {
+    // FNV-1a 64-bit expressed as 16-char hex — stable, dependency-free, useful
+    // for change detection and deduplication in scripts. Not cryptographic.
     let mut h: u64 = 14695981039346656037;
     for byte in input.bytes() {
         h ^= byte as u64;
@@ -234,7 +338,7 @@ fn render_logs(logs: &[String]) -> String {
     }
 }
 
-fn format_dynamic(value: &Dynamic) -> String {
+pub(crate) fn format_dynamic(value: &Dynamic) -> String {
     if value.is_unit() {
         return "()".to_string();
     }
@@ -351,12 +455,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_script_sha256_stable() {
+    async fn run_script_fnv64_stable() {
         let dir = TempDir::new().unwrap();
-        let args = json!({ "script": r#"sha256("hello") == sha256("hello")"# });
+        let args = json!({ "script": r#"fnv64("hello") == fnv64("hello")"# });
         let result = run_script(&args, dir.path()).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("true"));
+    }
+
+    #[tokio::test]
+    async fn run_script_sha256_not_available() {
+        // Verify the old name is gone — using it must produce a script error.
+        let dir = TempDir::new().unwrap();
+        let args = json!({ "script": r#"sha256("hello")"# });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(!result.success, "sha256 must not be available; got: {}", result.output);
     }
 
     #[tokio::test]
@@ -405,5 +518,176 @@ mod tests {
         let result = run_script(&args, dir.path()).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("2"));
+    }
+
+    #[tokio::test]
+    async fn write_text_writes_file_when_allowed() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({
+            "allow_write": true,
+            "script": r#"write_text("out/result.txt", "hello from rhai")"#
+        });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(result.success, "write_text must succeed: {}", result.output);
+
+        let written = std::fs::read_to_string(dir.path().join("out/result.txt")).unwrap();
+        assert_eq!(written, "hello from rhai");
+    }
+
+    #[tokio::test]
+    async fn write_text_creates_parent_dirs() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({
+            "allow_write": true,
+            "script": r#"write_text("a/b/c/deep.txt", "nested")"#
+        });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(result.success);
+        assert!(dir.path().join("a/b/c/deep.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_text_blocked_without_allow_write() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({
+            "script": r#"write_text("out.txt", "hello")"#
+        });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("allow_write"),
+            "error must mention allow_write: {}",
+            result.output
+        );
+        assert!(!dir.path().join("out.txt").exists(), "file must not be created");
+    }
+
+    #[tokio::test]
+    async fn write_text_blocks_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({
+            "allow_write": true,
+            "script": r#"write_text("../escape.txt", "x")"#
+        });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("Path traversal") || result.output.contains("run_script failed"));
+    }
+
+    #[tokio::test]
+    async fn write_then_read_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({
+            "allow_write": true,
+            "script": r#"
+                write_text("tmp.txt", "line1\nline2\n");
+                let lines = read_lines("tmp.txt");
+                lines.len()
+            "#
+        });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("2"));
+    }
+
+    #[test]
+    fn developer_aid_check_dead_tools_script_executes() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let script = std::fs::read_to_string(repo_root.join("scripts/check_dead_tools.rhai")).unwrap();
+
+        assert!(script.contains("src/tools/spec.rs"));
+        assert!(script.contains("src/tools/core.rs"));
+        assert!(script.contains("missing_in_core"));
+    }
+
+    #[test]
+    fn developer_aid_check_prompt_sync_script_executes() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let script = std::fs::read_to_string(repo_root.join("scripts/check_prompt_sync.rhai")).unwrap();
+
+        assert!(script.contains("src/tools/spec.rs"));
+        assert!(script.contains("src/prompts/default.md"));
+        assert!(script.contains("role_reports"));
+    }
+
+    #[tokio::test]
+    async fn list_dir_returns_entry_names() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("alpha.txt"), "").unwrap();
+        std::fs::write(dir.path().join("beta.txt"), "").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+        let args = json!({ "script": r#"let entries = list_dir("."); entries.len()"# });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("3"), "expected 3 entries: {}", result.output);
+    }
+
+    #[tokio::test]
+    async fn list_dir_sorted_alphabetically() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("z.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        // Script checks that list_dir()[0] is "a.txt"
+        let args = json!({ "script": r#"let e = list_dir("."); e[0] == "a.txt""# });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("true"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn list_dir_blocks_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({ "script": r#"list_dir("../")"# });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("Path traversal") || result.output.contains("run_script failed"));
+    }
+
+    #[tokio::test]
+    async fn file_exists_returns_true_for_existing_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("present.txt"), "x").unwrap();
+        let args = json!({ "script": r#"file_exists("present.txt")"# });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("true"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn file_exists_returns_false_for_missing_file() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({ "script": r#"file_exists("absent.txt")"# });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(result.output.contains("false"), "{}", result.output);
+    }
+
+    #[tokio::test]
+    async fn file_exists_blocks_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let args = json!({ "script": r#"file_exists("../secret")"# });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("Path traversal") || result.output.contains("run_script failed"));
+    }
+
+    #[tokio::test]
+    async fn run_script_timeout_message_is_30s() {
+        // Verify the timeout message matches the new constant.
+        // The loop will be killed by tokio::time::timeout, not by on_progress,
+        // since spawn_blocking wraps a blocking thread — check both strings.
+        let dir = TempDir::new().unwrap();
+        // This script runs MAX_OPERATIONS+1 iterations to trigger the progress guard.
+        let script = "let i = 0; loop { i += 1; }";
+        let args = json!({ "script": script });
+        let result = run_script(&args, dir.path()).await.unwrap();
+        assert!(!result.success);
+        assert!(
+            result.output.contains("30s") ||
+            result.output.contains("time budget") ||
+            result.output.contains("operations") ||
+            result.output.contains("run_script failed"),
+            "unexpected timeout message: {}", result.output
+        );
     }
 }

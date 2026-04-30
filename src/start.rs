@@ -6,6 +6,8 @@ use std::path::Path;
 
 #[path = "start/init.rs"]
 mod init;
+#[path = "start/check.rs"]
+mod check;
 #[path = "start/run_support.rs"]
 mod run_support;
 #[path = "start/shared.rs"]
@@ -18,6 +20,7 @@ mod status;
 mod tests;
 
 pub use init::cmd_init;
+pub use check::cmd_check;
 pub use shared::{
     check_dependencies, ensure_project_prompts, is_image_path, load_task_text_or_inline,
     load_text_or_inline, print_roles, resolve_role, setup_logging,
@@ -85,6 +88,14 @@ pub enum Commands {
         repo: String,
     },
 
+    /// Dry-run validation: config load, model reachability, and .ai/ structure
+    Check {
+        #[arg(long, short, default_value = ".")]
+        repo: String,
+        #[arg(long, short, default_value = "config.toml")]
+        config: String,
+    },
+
     /// Initialise .ai/ workspace in the current (or given) directory
     Init {
         #[arg(long, short, default_value = ".")]
@@ -137,6 +148,19 @@ pub async fn execute_command(cli: Cli) -> anyhow::Result<()> {
             cfg.validate_runtime().await?;
             check_dependencies().await?;
 
+            // ── Inbox poller ───────────────────────────────────────────────
+            // Start the Telegram /inbox poller if credentials are configured.
+            // The handle is stopped after agent.run() completes so the poller
+            // is active for the full duration of the session and no longer.
+            let inbox_poller =
+                match (cfg.telegram_token.clone(), cfg.telegram_chat_id.clone()) {
+                    (Some(token), Some(chat_id)) => {
+                        let repo_root = repo_path.to_path_buf();
+                        Some(crate::tools::start_inbox_poller(token, chat_id, repo_root))
+                    }
+                    _ => None,
+                };
+
             let agent_role = resolve_role(role.as_deref())?;
             let (task_image, task_text, task_source) = run_support::resolve_run_task_input(&task)?;
 
@@ -155,6 +179,12 @@ pub async fn execute_command(cli: Cli) -> anyhow::Result<()> {
             agent.set_config_source(config_source);
             let run_result = agent.run(&task_text, task_image, task_source).await;
             set_console_logs_enabled(false);
+
+            // Stop the inbox poller gracefully before cleanup
+            if let Some(handle) = inbox_poller {
+                handle.stop().await;
+            }
+
             run_result?;
 
             crate::tools::cleanup_background_processes(repo_path)?;
@@ -179,6 +209,11 @@ pub async fn execute_command(cli: Cli) -> anyhow::Result<()> {
             set_console_logs_enabled(true);
             setup_logging(&AgentConfig::default(), None)?;
             cmd_status(&repo)?;
+        }
+
+        Commands::Check { repo, config } => {
+            set_console_logs_enabled(true);
+            cmd_check(&repo, &config).await?;
         }
 
         Commands::Init {

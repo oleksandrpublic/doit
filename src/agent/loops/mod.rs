@@ -1,5 +1,5 @@
 use crate::agent::core::{StepOutcome, StopReason, SweAgent};
-use crate::agent::tools::{ParseActionError, ParseActionErrorKind, parse_action};
+use crate::agent::tools::{ParseActionError, ParseActionErrorKind, first_line, parse_action};
 use crate::history::Turn;
 use crate::tools::{self, ToolStatus, canonical_tool_name, find_tool_spec, tool_status};
 use crate::tui::TuiEvent;
@@ -34,6 +34,22 @@ fn suppress_human_escalation_for_error(role_name: &str, err: &str) -> bool {
     }
 
     false
+}
+
+/// Return true when the human response means "yes, continue".
+///
+/// Accepts common affirmative forms so the agent is not sensitive to exact
+/// phrasing. Telegram users tend to reply with natural language; TUI users
+/// type into a prompt box. Both paths produce the raw text here.
+///
+/// Accepted: "yes", "y", "да", "д", "continue", "ok", "продолжай"
+/// (all case-insensitive, leading/trailing whitespace trimmed).
+fn is_affirmative_response(text: &str) -> bool {
+    let normalized = text.trim().to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "yes" | "y" | "да" | "д" | "continue" | "ok" | "продолжай" | "proceed" | "go"
+    )
 }
 
 fn build_reroute_message(
@@ -119,7 +135,7 @@ fn handle_parse_failure(
             );
             if agent.consecutive_parse_failures() >= 2 {
                 anyhow::bail!(
-                    "Agent stuck: {} consecutive malformed actions ({})",
+                    "llm_malformed_action: model failed to produce valid JSON {} times in a row (detail: {})",
                     agent.consecutive_parse_failures(),
                     err.detail()
                 );
@@ -128,6 +144,49 @@ fn handle_parse_failure(
     }
 
     Ok(StepOutcome::Continue)
+}
+
+/// Build TUI callbacks and install them via set_tui_callbacks.
+///
+/// The ask_send callback sends TuiEvent::Prompt (non-blocking) and returns
+/// a oneshot receiver.  ask_human awaits the receiver directly, so the popup
+/// is guaranteed to appear before the Telegram select! race starts.
+fn install_tui_callbacks(tui: &crate::tui::TuiHandle) {
+    let tx1 = tui.tx.clone();
+    let tx2 = tui.tx.clone();
+    let tx3 = tui.tx.clone();
+    let tx4 = tui.tx.clone();
+    let tx5 = tui.tx.clone();
+    tools::human::set_tui_callbacks(
+        Some(Arc::new(move || {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
+            let _ = tx1.send(TuiEvent::Suspend(ack_tx));
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let _ = handle.block_on(ack_rx);
+            }
+        })),
+        Some(Arc::new(move || {
+            let _ = tx2.send(TuiEvent::Resume);
+        })),
+        Some(Arc::new(move |msg: &str| {
+            let _ = tx3.send(TuiEvent::Status(msg.to_string()));
+        })),
+        // ask_send: sends TuiEvent::Prompt immediately and returns the
+        // receiver.  Does NOT block — ask_human awaits the receiver itself.
+        Some(Arc::new(move |prompt: &str, timeout_secs: u64| {
+            let (resp_tx, resp_rx) =
+                tokio::sync::oneshot::channel::<Option<String>>();
+            let _ = tx4.send(TuiEvent::Prompt {
+                prompt: prompt.to_string(),
+                timeout_secs,
+                response: resp_tx,
+            });
+            resp_rx
+        })),
+        Some(Arc::new(move || {
+            let _ = tx5.send(TuiEvent::CancelPrompt);
+        })),
+    );
 }
 
 impl SweAgent {
@@ -362,94 +421,127 @@ impl SweAgent {
 
                     consecutive_errors += 1;
                     tracing::error!("Step {step} error: {e}");
+
+                    if e.to_string().contains("llm_malformed_action") {
+                        let summary = format!(
+                            "The model could not produce a valid response {} time(s) in a row at step {step}. \
+                             This usually means the model is not suitable for this task or the context window \
+                             is exhausted. Session terminated.",
+                            consecutive_errors
+                        );
+                        let stop_reason = StopReason::Error;
+                        self.tui_send(TuiEvent::Status("Model response format error — stopping".into()));
+                        self.tui_send(TuiEvent::SessionFinished {
+                            stop_reason,
+                            summary_preview: summary.clone(),
+                            steps_used: step,
+                        });
+                        let artifacts = self.session_finish(
+                            &effective_task,
+                            &summary,
+                            stop_reason,
+                            step,
+                            session_started_at,
+                            &session_started_at_str,
+                        );
+                        if self.depth() == 0 {
+                            self.shutdown_tui();
+                            self.print_final_summary(stop_reason, &summary, step, artifacts.as_ref());
+                        }
+                        return Ok(());
+                    }
+
                     if consecutive_errors >= 2
                         && !suppress_human_escalation_for_error(self.role().name(), &e.to_string())
                     {
+                        let user_friendly_error = if e.to_string().contains("malformed actions")
+                            || e.to_string().contains("empty parse responses")
+                        {
+                            format!(
+                                "The model failed to produce a valid response {} time(s) in a row. \
+                                 The model may not be suitable for this task or the context window \
+                                 may be exhausted.",
+                                consecutive_errors
+                            )
+                        } else {
+                            e.to_string()
+                        };
                         let question = format!(
                             "Agent has encountered {} consecutive errors.\nLast error: {}\n\nContinue? (yes/no)",
-                            consecutive_errors, e
+                            consecutive_errors, user_friendly_error
                         );
-                        let args = serde_json::json!({ "prompt": question, "timeout_secs": 300 });
-                        // Suspend TUI for stdin input
+                        // timeout_secs: 120 — don't block indefinitely on a yes/no question
+                        let args = serde_json::json!({ "prompt": question, "timeout_secs": 120 });
+
+                        // Install TUI callbacks for ask_human BEFORE dispatch
                         if let Some(h) = self.tui() {
-                            let tx1 = h.tx.clone();
-                            let tx2 = h.tx.clone();
-                            let tx3 = h.tx.clone();
-                            tools::human::set_tui_callbacks(
-                                Some(Arc::new(move || {
-                                    let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(0);
-                                    let _ = tx1.send(TuiEvent::Suspend(ack_tx));
-                                    let _ = ack_rx.recv();
-                                })),
-                                Some(Arc::new(move || {
-                                    let _ = tx2.send(TuiEvent::Resume);
-                                })),
-                                Some(Arc::new(|_msg: &str| {})),
-                                Some(Arc::new(move |prompt: &str, timeout_secs: u64| {
-                                    let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
-                                    let _ = tx3.send(TuiEvent::Prompt {
-                                        prompt: prompt.to_string(),
-                                        timeout_secs,
-                                        response: resp_tx,
-                                    });
-                                    resp_rx.recv().ok().flatten()
-                                })),
-                            );
+                            install_tui_callbacks(h);
                         }
                         tools::human::set_telegram_config(
                             self.cfg_snapshot().telegram_token.clone(),
                             self.cfg_snapshot().telegram_chat_id.clone(),
                         );
-                        match tools::dispatch_with_depth(
-                            "ask_human",
-                            &args,
-                            self.root(),
-                            self.depth(),
-                            &[],
-                            self.cfg_snapshot(),
+
+                        let stop = self.tui().map(|h| h.stop.clone());
+                        let ask_result = await_or_stop(
+                            stop,
+                            tools::dispatch_with_depth(
+                                "ask_human",
+                                &args,
+                                self.root(),
+                                self.depth(),
+                                &[],
+                                self.cfg_snapshot(),
+                            ),
                         )
-                        .await
-                        {
-                            Ok(result)
-                                if result.success
-                                    && result.output.to_lowercase().trim() == "yes" =>
-                            {
-                                consecutive_errors = 0;
-                            }
-                            _ => {
-                                let summary =
-                                    format!("Exited due to repeated errors at step {step}: {e}");
-                                let stop_reason = StopReason::Error;
-                                self.tui_send(TuiEvent::Status(
-                                    "Exiting due to repeated errors".into(),
-                                ));
-                                self.tui_send(TuiEvent::SessionFinished {
-                                    stop_reason,
-                                    summary_preview: summary.clone(),
-                                    steps_used: step,
-                                });
-                                let artifacts = self.session_finish(
-                                    &effective_task,
-                                    &summary,
-                                    stop_reason,
-                                    step,
-                                    session_started_at,
-                                    &session_started_at_str,
-                                );
-                                if self.depth() == 0 {
-                                    self.shutdown_tui();
-                                    self.print_final_summary(
-                                        stop_reason,
-                                        &summary,
-                                        step,
-                                        artifacts.as_ref(),
-                                    );
-                                }
-                                return Ok(());
-                            }
-                        }
-                        tools::human::set_tui_callbacks(None, None, None, None);
+                        .await;
+
+                        // Always clear callbacks and credentials after ask_human,
+                        // regardless of outcome. Failing to do this leaves stale
+                        // callbacks pointing at a closed TUI channel.
+                        tools::human::set_tui_callbacks(None, None, None, None, None);
                         tools::human::set_telegram_config(None, None);
+
+                        let should_continue = match ask_result {
+                            Ok(ref result) if result.success => {
+                                is_affirmative_response(&result.output)
+                            }
+                            _ => false,
+                        };
+
+                        if should_continue {
+                            consecutive_errors = 0;
+                        } else {
+                            let summary =
+                                format!("Exited due to repeated errors at step {step}: {e}");
+                            let stop_reason = StopReason::Error;
+                            self.tui_send(TuiEvent::Status(
+                                "Exiting due to repeated errors".into(),
+                            ));
+                            self.tui_send(TuiEvent::SessionFinished {
+                                stop_reason,
+                                summary_preview: summary.clone(),
+                                steps_used: step,
+                            });
+                            let artifacts = self.session_finish(
+                                &effective_task,
+                                &summary,
+                                stop_reason,
+                                step,
+                                session_started_at,
+                                &session_started_at_str,
+                            );
+                            if self.depth() == 0 {
+                                self.shutdown_tui();
+                                self.print_final_summary(
+                                    stop_reason,
+                                    &summary,
+                                    step,
+                                    artifacts.as_ref(),
+                                );
+                            }
+                            return Ok(());
+                        }
                     }
                     self.history_mut().push(Turn {
                         step,
@@ -581,6 +673,28 @@ impl SweAgent {
                             return Ok(summary);
                         }
 
+                        if e.to_string().contains("llm_malformed_action") {
+                            let summary = format!(
+                                "[sub-agent: {}] model failed to produce valid response at step {step}: {}",
+                                self.role().name(),
+                                e
+                            );
+                            tracing::warn!(
+                                "[sub-agent: {}] terminating on llm_malformed_action: {}",
+                                self.role().name(),
+                                e
+                            );
+                            self.session_finish(
+                                task,
+                                &summary,
+                                StopReason::Error,
+                                step,
+                                started_at,
+                                &started_at_str,
+                            );
+                            return Ok(summary);
+                        }
+
                         consecutive_errors += 1;
                         tracing::error!("[sub-agent] step {step} error: {e}");
                         if consecutive_errors >= 2
@@ -593,37 +707,51 @@ impl SweAgent {
                                 "[sub-agent] encountered {} consecutive errors.\nLast error: {}\n\nContinue? (yes/no)",
                                 consecutive_errors, e
                             );
+                            // timeout_secs: 120 for sub-agent questions too
                             let args =
-                                serde_json::json!({ "prompt": question, "timeout_secs": 300 });
+                                serde_json::json!({ "prompt": question, "timeout_secs": 120 });
+                            // Install TUI callbacks so ask_human can route through
+                            // the TUI prompt widget when TUI is active.
+                            if let Some(h) = self.tui() {
+                                install_tui_callbacks(h);
+                            }
                             tools::human::set_telegram_config(
                                 self.cfg_snapshot().telegram_token.clone(),
                                 self.cfg_snapshot().telegram_chat_id.clone(),
                             );
-                            match tools::dispatch_with_depth(
-                                "ask_human",
-                                &args,
-                                self.root(),
-                                self.depth(),
-                                &[],
-                                self.cfg_snapshot(),
+                            let stop = self.tui().map(|h| h.stop.clone());
+                            let ask_result = await_or_stop(
+                                stop,
+                                tools::dispatch_with_depth(
+                                    "ask_human",
+                                    &args,
+                                    self.root(),
+                                    self.depth(),
+                                    &[],
+                                    self.cfg_snapshot(),
+                                ),
                             )
-                            .await
-                            {
-                                Ok(result)
-                                    if result.success
-                                        && result.output.to_lowercase().trim() == "yes" =>
-                                {
-                                    consecutive_errors = 0;
-                                }
-                                _ => {
-                                    return Ok(format!(
-                                        "[sub-agent: {}] exited due to repeated errors: {}",
-                                        self.role().name(),
-                                        e
-                                    ));
-                                }
-                            }
+                            .await;
+
+                            // Always clear callbacks and credentials after ask_human
+                            tools::human::set_tui_callbacks(None, None, None, None, None);
                             tools::human::set_telegram_config(None, None);
+
+                            let should_continue = match ask_result {
+                                Ok(ref result) if result.success => {
+                                    is_affirmative_response(&result.output)
+                                }
+                                _ => false,
+                            };
+
+                            if !should_continue {
+                                return Ok(format!(
+                                    "[sub-agent: {}] exited due to repeated errors: {}",
+                                    self.role().name(),
+                                    e
+                                ));
+                            }
+                            consecutive_errors = 0;
                         }
                         self.history_mut().push(Turn {
                             step,
@@ -682,7 +810,6 @@ impl SweAgent {
             )
             .await?;
             tracing::debug!("LLM raw:\n{raw}");
-            // Estimate token counts from char lengths (chars/4 ≈ tokens for typical LLM output)
             self.tui_send(TuiEvent::Tokens {
                 prompt: (user_message.len() / 4) as u32,
                 output: (raw.len() / 4) as u32,
@@ -760,6 +887,10 @@ impl SweAgent {
                 } else {
                     println!("  Step {:>2}: {}", step, canonical_tool);
                 }
+                let thought_line = first_line(&action.thought, 100);
+                if !thought_line.is_empty() {
+                    println!("           why: {}", thought_line);
+                }
             }
             if canonical_tool == "finish" {
                 let summary = action
@@ -800,44 +931,18 @@ impl SweAgent {
                     ToolStatus::Real => {}
                 }
             }
-            // Give human.rs type-erased TUI callbacks for suspend/resume/status
             if let Some(h) = self.tui() {
-                let tx1 = h.tx.clone();
-                let tx2 = h.tx.clone();
-                let tx3 = h.tx.clone();
-                let tx4 = h.tx.clone();
-                tools::human::set_tui_callbacks(
-                    Some(Arc::new(move || {
-                        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(0);
-                        let _ = tx1.send(TuiEvent::Suspend(ack_tx));
-                        let _ = ack_rx.recv();
-                    })),
-                    Some(Arc::new(move || {
-                        let _ = tx2.send(TuiEvent::Resume);
-                    })),
-                    Some(Arc::new(move |msg: &str| {
-                        let _ = tx3.send(TuiEvent::Status(msg.to_string()));
-                    })),
-                    Some(Arc::new(move |prompt: &str, timeout_secs: u64| {
-                        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
-                        let _ = tx4.send(TuiEvent::Prompt {
-                            prompt: prompt.to_string(),
-                            timeout_secs,
-                            response: resp_tx,
-                        });
-                        resp_rx.recv().ok().flatten()
-                    })),
-                );
+                install_tui_callbacks(h);
             }
-            // Provide telegram credentials to human.rs for notify/ask_human
             tools::human::set_telegram_config(
                 self.cfg_snapshot().telegram_token.clone(),
                 self.cfg_snapshot().telegram_chat_id.clone(),
             );
-            // Provide TUI sender to agents.rs so spawn_agent can forward
-            // SubAgentSpawned/SubAgentFinished events to the parent TUI.
             if let Some(h) = self.tui() {
                 crate::agent::spawn::set_tui_sender(Some(Arc::new(h.tx.clone())));
+            }
+            if let Some(ref decision) = action.decision {
+                self.append_decision(step, &canonical_tool, decision);
             }
             let stop = self.tui().map(|h| h.stop.clone());
             let result = await_or_stop(
@@ -852,7 +957,7 @@ impl SweAgent {
                 ),
             )
             .await?;
-            tools::human::set_tui_callbacks(None, None, None, None);
+            tools::human::set_tui_callbacks(None, None, None, None, None);
             tools::human::set_telegram_config(None, None);
             crate::agent::spawn::set_tui_sender(None);
             let annotated_output = match tool_status(&canonical_tool) {

@@ -10,6 +10,7 @@ pub mod redaction;
 pub mod shell;
 pub mod start;
 pub mod task_state;
+pub mod text;
 pub mod tools;
 pub mod tui;
 pub mod validation;

@@ -1,4 +1,4 @@
-use crate::tools::utils::resolve_safe_path;
+use crate::validation::resolve_safe_path;
 use crate::tools::{ToolDispatchKind, canonical_tool_name};
 use anyhow::{Result, bail};
 use chrono::Utc;
@@ -11,6 +11,11 @@ pub struct LlmAction {
     pub thought: String,
     pub tool: String,
     pub args: Value,
+    /// Optional decision annotation: WHY the agent made this choice.
+    /// When present, automatically appended to .ai/state/session_decisions.md.
+    /// Agents do not need to call memory_write — this is a zero-cost step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -146,15 +151,17 @@ pub async fn dispatch_with_depth(
         "github_api" => crate::tools::web::github_api(args).await,
         "test_coverage" => crate::tools::test_coverage::test_coverage(args, root).await,
         "run_script" => crate::tools::scripting::run_script(args, root).await,
-        "browser_action" => crate::tools::browser::browser_action(args, root).await,
-        "browser_get_text" => crate::tools::browser::browser_get_text(args, root).await,
-        "browser_navigate" => crate::tools::browser::browser_navigate(args, root).await,
-        "screenshot" => crate::tools::browser::browser_screenshot(args, root).await,
+        "check_awp_server" => crate::tools::browser::check_awp_server(args, root, &cfg.browser).await,
+        "browser_action" => crate::tools::browser::browser_action(args, root, &cfg.browser).await,
+        "browser_get_text" => crate::tools::browser::browser_get_text(args, root, &cfg.browser).await,
+        "browser_navigate" => crate::tools::browser::browser_navigate(args, root, &cfg.browser).await,
+        "screenshot" => crate::tools::browser::browser_screenshot(args, root, &cfg.browser).await,
         "tool_request" => crate::tools::self_improvement::tool_request(args, root).await,
         "capability_gap" => crate::tools::self_improvement::capability_gap(args, root).await,
         "memory_read" => crate::tools::memory::memory_read(args, root).await,
         "memory_write" => crate::tools::memory::memory_write(args, root).await,
         "memory_delete" => crate::tools::memory::memory_delete(args, root).await,
+        "checkpoint" => crate::tools::memory::checkpoint(args, root).await,
         "tree" => crate::tools::workspace::tree(args, root).await,
         "project_map" => crate::tools::workspace::project_map(args, root).await,
         "find_entrypoints" => crate::tools::workspace::find_entrypoints(args, root).await,
@@ -258,6 +265,49 @@ mod tests {
         assert!(!now.is_empty());
         assert!(now.contains('-'));
         assert!(now.contains(':'));
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_depth_rejects_unknown_tool() {
+        // Guards against regressions that remove the Unknown tool bail path,
+        // which would cause silent no-ops instead of explicit errors when a
+        // tool name is misspelled or unregistered.
+        let root = test_root();
+        let args = json!({});
+        let result = dispatch_with_depth(
+            "this_tool_does_not_exist_xyz",
+            &args,
+            &root,
+            0,
+            &[],
+            &crate::config_struct::AgentConfig::default(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Unknown tool"),
+            "error must mention 'Unknown tool'"
+        );
+    }
+
+    #[test]
+    fn llm_action_parses_decision_field() {
+        // The decision field is optional — must not break parsing when absent.
+        let without_decision: LlmAction = serde_json::from_str(
+            r#"{"thought":"inspect","tool":"read_file","args":{"path":"src/lib.rs"}}"#,
+        ).unwrap();
+        assert!(without_decision.decision.is_none());
+
+        // When present, must be captured.
+        let with_decision: LlmAction = serde_json::from_str(
+            r#"{"thought":"inspect","tool":"read_file","args":{"path":"src/lib.rs"},
+                "decision":"Using read_file instead of outline because I need the full body"}"#,
+        ).unwrap();
+        assert_eq!(
+            with_decision.decision.as_deref(),
+            Some("Using read_file instead of outline because I need the full body")
+        );
     }
 }
 

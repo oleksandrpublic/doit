@@ -140,16 +140,8 @@ pub fn strip_fences(s: &str) -> &str {
 }
 
 /// Get first line of output, truncated to max length.
-pub fn first_line(s: &str, max: usize) -> String {
-    let line = s.lines().next().unwrap_or("").trim();
-    let mut chars = line.chars();
-    let collected: String = chars.by_ref().take(max).collect();
-    if chars.next().is_some() {
-        format!("{collected}…")
-    } else {
-        collected
-    }
-}
+/// Re-exported from `crate::text` to avoid circular imports.
+pub use crate::text::first_line;
 
 /// Format action args for display (truncate long output).
 pub fn format_args_display(args: &Value) -> String {

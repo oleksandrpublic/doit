@@ -128,7 +128,7 @@ max_depth      = 3
 
 # ── Browser backend (optional) ────────────────────────────────────────────────
 # [browser]
-# cdp_url        = "ws://127.0.0.1:9222"
+# awp_url        = "http://127.0.0.1:9222"
 # screenshot_dir = ".ai/screenshots"
 "#,
             backend = backend,

@@ -237,6 +237,67 @@ fn home_dir() -> Option<PathBuf> {
     }
 }
 
+/// Ensure `user_profile.md` and `boss_notes.md` exist in `~/.do_it/`.
+///
+/// Called at `session_init` for installations that pre-date the template
+/// scaffolding added in Sprint 2. Safe to call repeatedly: does not
+/// overwrite files that already exist, even if they are empty.
+pub fn ensure_memory_files_exist() {
+    let dir = match global_config_dir() {
+        Some(d) => d,
+        None => return,
+    };
+    if !dir.exists() {
+        // Directory will be created by ensure_global_config() on the next
+        // explicit first-run path; we don't create it here to avoid
+        // surprising the user with a hidden directory on every session_init.
+        return;
+    }
+
+    let memory_files: &[(&str, &str)] = &[
+        (
+            "user_profile.md",
+            "# User profile\n\
+             #\n\
+             # The Boss agent reads this file at the start of every session.\n\
+             # Describe your preferences so the agent works the way you like.\n\
+             #\n\
+             # Suggested sections:\n\
+             #\n\
+             # ## Communication\n\
+             # - Preferred language: English\n\
+             # - Response style: concise, technical\n\
+             #\n\
+             # ## Development stack\n\
+             # - Primary language: Rust\n\
+             # - Architecture notes: isolated Cargo workspaces\n\
+             #\n\
+             # ## Workflow preferences\n\
+             # - Prefer full rewrites over patch accumulation when fixes cause regressions\n\
+             # - Always run clippy before committing\n",
+        ),
+        (
+            "boss_notes.md",
+            "# Boss notes\n\
+             #\n\
+             # Cross-project insights accumulated by the Boss agent.\n\
+             # The Boss appends here when it discovers something worth keeping beyond the current project.\n\
+             #\n",
+        ),
+    ];
+
+    for (name, template) in memory_files {
+        let path = dir.join(name);
+        if !path.exists() {
+            if let Err(e) = std::fs::write(&path, template) {
+                tracing::warn!("ensure_memory_files_exist: could not create {}: {e}", path.display());
+            } else {
+                tracing::info!("ensure_memory_files_exist: created {}", path.display());
+            }
+        }
+    }
+}
+
 /// Ensure ~/.do_it/ exists with default files on first run.
 pub fn ensure_global_config() {
     let dir = match global_config_dir() {
@@ -554,5 +615,122 @@ system_prompt = "Repo prompt override"
         }
 
         assert_eq!(cfg_with_repo_prompt.system_prompt, "Repo prompt override");
+    }
+
+    #[test]
+    #[serial]
+    fn load_for_repo_with_source_falls_back_to_built_in_defaults_when_nothing_present() {
+        let temp = TempDir::new().unwrap();
+        let empty_repo = temp.path().join("empty_repo");
+        std::fs::create_dir_all(&empty_repo).unwrap();
+
+        let fake_home = temp.path().join("fake_home");
+        std::fs::create_dir_all(&fake_home).unwrap();
+        let previous_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("USERPROFILE", &fake_home);
+
+        let loaded = AgentConfig::load_for_repo_with_source(None, Some(&empty_repo));
+
+        match previous_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        assert_eq!(
+            loaded.source, "built-in defaults",
+            "source must be 'built-in defaults' when no config file exists anywhere"
+        );
+        assert_eq!(
+            loaded.config.model,
+            AgentConfig::default().model,
+            "config must equal AgentConfig::default() when no config file exists"
+        );
+    }
+
+    #[test]
+    fn load_or_default_with_source_returns_defaults_for_nonexistent_path() {
+        let loaded =
+            AgentConfig::load_or_default_with_source("/tmp/this_config_does_not_exist_xyz.toml");
+
+        assert_eq!(
+            loaded.source, "built-in defaults",
+            "source must be 'built-in defaults' for a missing path"
+        );
+        assert_eq!(
+            loaded.config.model,
+            AgentConfig::default().model,
+            "config must equal AgentConfig::default() for a missing path"
+        );
+    }
+
+    // ── ensure_memory_files_exist ─────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn ensure_memory_files_creates_missing_files() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        // Create ~/.do_it/ but leave memory files absent
+        let dot_do_it = home.join(".do_it");
+        std::fs::create_dir_all(&dot_do_it).unwrap();
+
+        let previous_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("USERPROFILE", &home);
+
+        ensure_memory_files_exist();
+
+        match previous_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        assert!(dot_do_it.join("user_profile.md").exists(), "user_profile.md must be created");
+        assert!(dot_do_it.join("boss_notes.md").exists(), "boss_notes.md must be created");
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_memory_files_does_not_overwrite_existing() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let dot_do_it = home.join(".do_it");
+        std::fs::create_dir_all(&dot_do_it).unwrap();
+
+        let user_profile_path = dot_do_it.join("user_profile.md");
+        std::fs::write(&user_profile_path, "my custom profile content").unwrap();
+
+        let previous_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("USERPROFILE", &home);
+
+        ensure_memory_files_exist();
+
+        match previous_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        let content = std::fs::read_to_string(&user_profile_path).unwrap();
+        assert_eq!(content, "my custom profile content", "existing file must not be overwritten");
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_memory_files_noop_when_dot_do_it_absent() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home_no_dot_do_it");
+        // Do NOT create ~/.do_it — function should return silently
+        std::fs::create_dir_all(&home).unwrap();
+
+        let previous_userprofile = std::env::var("USERPROFILE").ok();
+        std::env::set_var("USERPROFILE", &home);
+
+        ensure_memory_files_exist(); // must not panic or create the directory
+
+        match previous_userprofile {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+
+        assert!(!home.join(".do_it").exists(), ".do_it must not be created");
     }
 }

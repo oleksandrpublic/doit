@@ -40,23 +40,11 @@ use ratatui::{
 use tokio::sync::mpsc;
 
 use crate::agent::core::StopReason;
+use crate::text::truncate_chars;
 
 // ─── Global TUI active flag ───────────────────────────────────────────────────
-// Lives in tui.rs (lib only) to avoid dual-compilation issues.
 // Set to true when top-level agent activates TUI.
 // Sub-agents and step() check this to suppress stdout output.
-
-/// Truncate a string to at most `max_chars` Unicode scalar values,
-/// appending '…' if truncated. Safe with any UTF-8 input.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    let mut chars = s.chars();
-    let collected: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{collected}…")
-    } else {
-        collected
-    }
-}
 
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -70,7 +58,7 @@ pub fn tui_is_active() -> bool {
 
 // ─── Events sent from the agent loop to the TUI thread ───────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum TuiEvent {
     /// Agent started a new session
     SessionStarted {
@@ -115,11 +103,15 @@ pub enum TuiEvent {
     Prompt {
         prompt: String,
         timeout_secs: u64,
-        response: std::sync::mpsc::SyncSender<Option<String>>,
+        response: tokio::sync::oneshot::Sender<Option<String>>,
     },
+    /// Cancel an in-progress Prompt (e.g. because Telegram answered first).
+    /// The active prompt_state is dismissed by sending None into its response
+    /// channel; no stop flag is set and the TUI continues running normally.
+    CancelPrompt,
     /// Suspend TUI temporarily (e.g. for stdin input). TUI exits alternate screen.
     /// The oneshot sender is signalled once TUI has fully suspended.
-    Suspend(std::sync::mpsc::SyncSender<()>),
+    Suspend(tokio::sync::oneshot::Sender<()>),
     /// Resume TUI after suspension.
     Resume,
     /// Request graceful shutdown
@@ -147,10 +139,14 @@ impl TuiHandle {
     /// Suspend the TUI so stdin becomes readable. Blocks until TUI has exited
     /// alternate screen. Must be paired with resume().
     pub fn suspend(&self) {
-        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(TuiEvent::Suspend(tx));
-        // Wait until TUI confirms it has left alternate screen
-        let _ = rx.recv();
+        // Block until TUI confirms it has left alternate screen.
+        // This is called from a sync context (spawn_blocking inside human.rs),
+        // so we drive the oneshot to completion via the current tokio Handle.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = handle.block_on(rx);
+        }
     }
 
     /// Resume the TUI after suspend().
@@ -176,6 +172,7 @@ struct TuiState {
     max_steps: usize,
     current_step: usize,
     status: String,
+    last_decision: String,
     log: Vec<LogEntry>,
     log_scroll: usize,
     tokens_prompt_total: u32,
@@ -202,7 +199,7 @@ struct LogEntry {
 struct PromptState {
     prompt: String,
     input: String,
-    response: std::sync::mpsc::SyncSender<Option<String>>,
+    response: tokio::sync::oneshot::Sender<Option<String>>,
     deadline: Option<Instant>,
 }
 
@@ -215,6 +212,7 @@ impl TuiState {
             max_steps: 30,
             current_step: 0,
             status: "Initialising...".into(),
+            last_decision: String::new(),
             log: Vec::new(),
             log_scroll: 0,
             tokens_prompt_total: 0,
@@ -248,7 +246,7 @@ impl TuiState {
             }
             TuiEvent::StepStarted {
                 step,
-                thought: _,
+                thought,
                 tool,
                 args_preview,
             } => {
@@ -256,6 +254,9 @@ impl TuiState {
                 self.tokens_prompt_step = 0;
                 self.tokens_output_step = 0;
                 self.status = format!("step {step}  {tool}");
+                if !thought.is_empty() {
+                    self.last_decision = truncate_chars(&thought, 28);
+                }
                 self.log.push(LogEntry {
                     step,
                     success: None,
@@ -296,7 +297,7 @@ impl TuiState {
                     entry.success = Some(success);
                     entry.text = format!(
                         "step {step:3}  {icon}  {tool}  {}",
-                        truncate_chars(&output_preview, 60)
+                        truncate_chars(&output_preview, 120)
                     );
                 }
                 self.status = format!("step {step}  {icon}  {tool}");
@@ -366,6 +367,14 @@ impl TuiState {
                         Some(Instant::now() + Duration::from_secs(timeout_secs))
                     },
                 });
+            }
+            TuiEvent::CancelPrompt => {
+                // Dismiss active prompt without setting stop flag.
+                // Used when Telegram (or another channel) answered first.
+                if let Some(prompt) = self.prompt_state.take() {
+                    let _ = prompt.response.send(None);
+                    self.status = "Input received via Telegram".into();
+                }
             }
             TuiEvent::Quit => {}
             TuiEvent::Suspend(_) | TuiEvent::Resume => {}
@@ -513,48 +522,52 @@ fn run_tui(mut rx: mpsc::UnboundedReceiver<TuiEvent>, stop: Arc<AtomicBool>) -> 
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                if let Some(prompt) = state.prompt_state.as_mut() {
+                if state.prompt_state.is_some() {
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            let tx = prompt.response.clone();
-                            state.prompt_state = None;
-                            let _ = tx.send(None);
+                            if let Some(ps) = state.prompt_state.take() {
+                                let _ = ps.response.send(None);
+                            }
                             stop.store(true, Ordering::Relaxed);
                             state.status = "Stop requested".into();
                             running = false;
                         }
                         KeyCode::Char('q') if key.modifiers.is_empty() => {
-                            let tx = prompt.response.clone();
-                            state.prompt_state = None;
-                            let _ = tx.send(None);
+                            if let Some(ps) = state.prompt_state.take() {
+                                let _ = ps.response.send(None);
+                            }
                             stop.store(true, Ordering::Relaxed);
                             state.status = "Stop requested".into();
                             running = false;
                         }
                         KeyCode::Enter => {
-                            let value = prompt.input.trim().to_string();
-                            let response = if value.is_empty() {
-                                Some("(no input provided)".to_string())
-                            } else {
-                                Some(value)
-                            };
-                            let tx = prompt.response.clone();
-                            state.prompt_state = None;
-                            let _ = tx.send(response);
+                            if let Some(ps) = state.prompt_state.take() {
+                                let value = ps.input.trim().to_string();
+                                let response = if value.is_empty() {
+                                    Some("(no input provided)".to_string())
+                                } else {
+                                    Some(value)
+                                };
+                                let _ = ps.response.send(response);
+                            }
                             state.status = "Input submitted".into();
                         }
                         KeyCode::Char(c) => {
                             if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                                prompt.input.push(c);
+                                if let Some(ps) = state.prompt_state.as_mut() {
+                                    ps.input.push(c);
+                                }
                             }
                         }
                         KeyCode::Backspace => {
-                            prompt.input.pop();
+                            if let Some(ps) = state.prompt_state.as_mut() {
+                                ps.input.pop();
+                            }
                         }
                         KeyCode::Esc => {
-                            let tx = prompt.response.clone();
-                            state.prompt_state = None;
-                            let _ = tx.send(None);
+                            if let Some(ps) = state.prompt_state.take() {
+                                let _ = ps.response.send(None);
+                            }
                             state.status = "Input cancelled".into();
                         }
                         _ => {}
@@ -636,7 +649,7 @@ fn render(f: &mut ratatui::Frame, state: &TuiState) {
 
     let body = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(26), Constraint::Min(0)])
+        .constraints([Constraint::Length(32), Constraint::Min(0)])
         .split(outer[1]);
 
     let progress_ratio = if state.max_steps > 0 {
@@ -695,6 +708,22 @@ fn render(f: &mut ratatui::Frame, state: &TuiState) {
                     state.tokens_prompt_total, state.tokens_output_total
                 ),
                 Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Last decision ",
+            Style::default().fg(Color::Gray),
+        )]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                if state.last_decision.is_empty() {
+                    "—".into()
+                } else {
+                    state.last_decision.clone()
+                },
+                Style::default().fg(Color::White),
             ),
         ]),
         Line::from(""),

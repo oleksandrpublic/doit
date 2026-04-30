@@ -52,7 +52,7 @@ fn session_artifacts_are_written_after_init_and_finish() {
     let trace_raw = std::fs::read_to_string(&trace_path).unwrap();
     let trace: serde_json::Value = serde_json::from_str(&trace_raw)
         .expect("trace file must be valid JSON");
-    assert_eq!(trace["schema_version"], 3);
+    assert_eq!(trace["schema_version"], 4);
     assert_eq!(trace["session_nr"], 1);
     assert_eq!(trace["stop_reason"], "success");
 

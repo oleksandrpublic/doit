@@ -27,9 +27,9 @@ pub enum BackendKind {
     /// Ollama — `POST /api/chat`
     #[default]
     Ollama,
-    /// Any OpenAI-compatible endpoint — `POST /v1/chat/completions`
+    /// Any OpenAI-compatible endpoint — `POST /chat/completions`
     OpenAI,
-    /// Any Anthropic-compatible endpoint — `POST /v1/messages`
+    /// Any Anthropic-compatible endpoint — `POST /messages`
     Anthropic,
 }
 
@@ -230,7 +230,7 @@ impl LlmClient {
             ]
         });
 
-        let url = format!("{}/v1/chat/completions", self.cfg.url);
+        let url = format!("{}/chat/completions", self.cfg.url);
         let resp = self.post_json(&url, &body).await?;
         extract_openai_text(&resp)
     }
@@ -270,7 +270,7 @@ impl LlmClient {
             ]
         });
 
-        let url = format!("{}/v1/messages", self.cfg.url);
+        let url = format!("{}/messages", self.cfg.url);
 
         let mut req = self
             .http

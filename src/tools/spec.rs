@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// The full `run_script` (Rhai) guide injected into agent prompts for roles
+/// that have `run_script` in their allowlist.
+///
+/// Loaded at compile time — no runtime I/O, no drift between the guide and
+/// the binary. Lives in `src/tools/scripting_guide.md`.
+pub const RUN_SCRIPT_GUIDE: &str = include_str!("scripting_guide.md");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
     Real,
@@ -59,13 +66,13 @@ pub struct ToolSpec {
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool registry
 //
-// Core tool budget per role (optional groups excluded, target ≤ 12):
+// Core tool budget per role (optional groups excluded):
 //
 //   boss:      11  — orchestration, memory, web_search, tree/project_map
-//   developer: 18  — write/run/git/memory/notify/script/targeted-test/format/preview/multi/fuzzy helpers  (no fs-search — use navigator)
-//   navigator: 11  — read/search/code-intelligence
-//   qa:        15  — read-subset/run/diff/git-read/memory/coverage/script/targeted-test
-//   reviewer:   9  — read-subset/code-intelligence/diff
+//   developer: 20  — write/run/git/memory/notify/script/targeted-test/format/preview/multi/fuzzy/open_file_region/diff_repo/git_stash
+//   navigator: 16  — read/search/code-intelligence/run_script/find_entrypoints
+//   qa:        16  — read-subset/run/diff/git-read/memory/coverage/script/targeted-test
+//   reviewer:  12  — read-subset/code-intelligence/diff
 //   research:   6  — web/memory (unchanged)
 //   memory:     3  — memory only (unchanged)
 //
@@ -77,11 +84,8 @@ pub struct ToolSpec {
 
 const TOOL_SPECS: &[ToolSpec] = &[
     // ── Filesystem read ──────────────────────────────────────────────────────
-    // navigator: full read access
-    // qa/reviewer: read files they're inspecting
-    // developer: read_file only — for targeted reads after navigator maps the codebase
     ToolSpec { canonical_name: "read_file",         aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "navigator", "qa", "reviewer"],            group: None,                        prompt_category: "Filesystem",        prompt_line: "- read_file(path, start_line?, end_line?)            — View a file with line numbers" },
-    ToolSpec { canonical_name: "open_file_region",  aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator"],                         group: None,                        prompt_category: "Filesystem",        prompt_line: "- open_file_region(path, line, before?, after?)      — Focused region around a line" },
+    ToolSpec { canonical_name: "open_file_region",  aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "navigator"],                               group: None,                        prompt_category: "Filesystem",        prompt_line: "- open_file_region(path, line, before?, after?)      — Focused region around a line" },
     ToolSpec { canonical_name: "list_dir",          aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- list_dir(path?)                                    — List directory contents" },
     ToolSpec { canonical_name: "find_files",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- find_files(pattern, dir?)                          — Find files by name or glob" },
     ToolSpec { canonical_name: "search_in_files",   aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator", "qa", "reviewer"],                         group: None,                        prompt_category: "Filesystem",        prompt_line: "- search_in_files(pattern, dir?, ext?)               — Regex search across file contents" },
@@ -91,63 +95,84 @@ const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec { canonical_name: "write_file",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- write_file(path, content)                          — Overwrite a file completely" },
     ToolSpec { canonical_name: "str_replace",       aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- str_replace(path, old_str, new_str)                — Replace a unique string in a file" },
     ToolSpec { canonical_name: "apply_patch_preview", aliases: &[],                   status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- apply_patch_preview(path, content? | old_str, new_str) — Preview an edit as a diff [experimental]" },
-    ToolSpec { canonical_name: "str_replace_multi",    aliases: &[],                   status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- str_replace_multi(path, edits[])                   — Apply multiple replacements in one call" },
-    ToolSpec { canonical_name: "str_replace_fuzzy",    aliases: &[],                   status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- str_replace_fuzzy(path, old_str, new_str)           — Replace with whitespace-tolerant matching [experimental]" },
+    ToolSpec { canonical_name: "str_replace_multi",    aliases: &[],                  status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- str_replace_multi(path, edits[])                   — Apply multiple replacements in one call" },
+    ToolSpec { canonical_name: "str_replace_fuzzy",    aliases: &[],                  status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Filesystem",        prompt_line: "- str_replace_fuzzy(path, old_str, new_str)           — Replace with whitespace-tolerant matching [experimental]" },
 
     // ── Execution ────────────────────────────────────────────────────────────
     ToolSpec { canonical_name: "run_command",       aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa"],                                     group: None,                        prompt_category: "Execution",         prompt_line: "- run_command(program, args[], cwd?, timeout_secs?)   — Run an executable (no shell)" },
     ToolSpec { canonical_name: "format_changed_files_only", aliases: &[],             status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Execution",         prompt_line: "- format_changed_files_only(dir?, check_only?)        — Format changed Rust files only [experimental]" },
-    ToolSpec { canonical_name: "diff_repo",         aliases: &["workspace_diff"],     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["qa", "reviewer"],                         group: None,                        prompt_category: "Execution",         prompt_line: "- diff_repo(base?, staged?, stat?)                   — Git diff vs HEAD or a ref" },
+    ToolSpec { canonical_name: "diff_repo",         aliases: &["workspace_diff"],     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa", "reviewer"],                         group: None,                        prompt_category: "Execution",         prompt_line: "- diff_repo(base?, staged?, stat?)                   — Git diff vs HEAD or a ref" },
     ToolSpec { canonical_name: "read_test_failure", aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["qa"],                                                  group: None,                        prompt_category: "Execution",         prompt_line: "- read_test_failure(path?, test?, index?)            — Extract a failing test block from a log" },
-    ToolSpec { canonical_name: "test_coverage",     aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["qa"],                                              group: None,                        prompt_category: "Execution",         prompt_line: "- test_coverage(dir?, threshold?, timeout_secs?)     — Run tests with coverage" },
+    ToolSpec { canonical_name: "test_coverage",     aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["qa"],                                                  group: None,                        prompt_category: "Execution",         prompt_line: "- test_coverage(dir?, threshold?, timeout_secs?)     — Run tests with coverage" },
     ToolSpec { canonical_name: "run_targeted_test", aliases: &[],                     status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa"],                                     group: None,                        prompt_category: "Execution",         prompt_line: "- run_targeted_test(path?, test?, kind?, target?)     — Run a narrow Rust test target [experimental]" },
     ToolSpec { canonical_name: "run_script",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa", "navigator"],                        group: None,                        prompt_category: "Execution",         prompt_line: "- run_script(script, dir?)                            — Compute/transform/validate data in a sandboxed Rhai script (read_lines, read_text, regex_match, regex_find_all, parse_json, sha256, log). Use instead of run_command for pure data work." },
 
     // ── Git ──────────────────────────────────────────────────────────────────
     ToolSpec { canonical_name: "git_status",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa"],                                     group: None,                        prompt_category: "Git",               prompt_line: "- git_status(short?)                                 — Working tree status and branch info" },
     ToolSpec { canonical_name: "git_commit",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Git",               prompt_line: "- git_commit(message, files?, allow_empty?)          — Stage files and commit" },
-    ToolSpec { canonical_name: "git_log",           aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["qa", "reviewer"],                         group: None,                        prompt_category: "Git",               prompt_line: "- git_log(n?, path?, oneline?)                       — Recent commit history" },
+    ToolSpec { canonical_name: "git_log",           aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["qa", "reviewer"],                                      group: None,                        prompt_category: "Git",               prompt_line: "- git_log(n?, path?, oneline?)                       — Recent commit history" },
     ToolSpec { canonical_name: "git_pull",          aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa"],                                     group: None,                        prompt_category: "Git",               prompt_line: "- git_pull(remote?, branch?)                         — Fetch remote changes safely" },
     ToolSpec { canonical_name: "git_push",          aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Git",               prompt_line: "- git_push(remote?, branch?, force?)                 — Push to remote (requires consent)" },
-    ToolSpec { canonical_name: "git_stash",         aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &[],                                           group: None,                        prompt_category: "Git",               prompt_line: "- git_stash(action, message?, index?)                — Manage git stashes" },
+    ToolSpec { canonical_name: "git_stash",         aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer"],                                           group: None,                        prompt_category: "Git",               prompt_line: "- git_stash(action, message?, index?)                — Manage git stashes" },
 
     // ── Internet ─────────────────────────────────────────────────────────────
     ToolSpec { canonical_name: "web_search",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "research"],                                    group: None,                        prompt_category: "Internet",          prompt_line: "- web_search(query, max_results?)                    — Search the web" },
     ToolSpec { canonical_name: "fetch_url",         aliases: &["web_fetch"],          status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["research"],                                            group: None,                        prompt_category: "Internet",          prompt_line: "- fetch_url(url, selector?)                          — Read a web page or documentation" },
-    ToolSpec { canonical_name: "github_api",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa"],                                     group: Some(ToolGroup::Github),     prompt_category: "Internet",          prompt_line: "- github_api(method, endpoint, body?, token?)        — GitHub REST API" },
+    ToolSpec { canonical_name: "github_api",        aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["developer", "qa"],                                     group: Some(ToolGroup::Github),      prompt_category: "Internet",          prompt_line: "- github_api(method, endpoint, body?, token?)        — GitHub REST API" },
 
     // ── Code Intelligence ────────────────────────────────────────────────────
-    // navigator and reviewer only — developer uses read_file + spawn_agent(navigator)
     ToolSpec { canonical_name: "get_symbols",       aliases: &["analyze_code"],       status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator", "reviewer"],                               group: None,                        prompt_category: "Code Intelligence", prompt_line: "- get_symbols(path, kinds?)                          — List symbols in a file" },
     ToolSpec { canonical_name: "outline",           aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator", "reviewer"],                               group: None,                        prompt_category: "Code Intelligence", prompt_line: "- outline(path)                                      — Structural outline with signatures" },
-    ToolSpec { canonical_name: "get_signature",     aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["reviewer"],                               group: None,                        prompt_category: "Code Intelligence", prompt_line: "- get_signature(path, name, lines?)                   — Symbol signature and docs" },
+    ToolSpec { canonical_name: "get_signature",     aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator","reviewer"],                                            group: None,                        prompt_category: "Code Intelligence", prompt_line: "- get_signature(path, name, lines?)                   — Symbol signature and docs" },
     ToolSpec { canonical_name: "find_references",   aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator", "reviewer"],                               group: None,                        prompt_category: "Code Intelligence", prompt_line: "- find_references(name, dir?, ext?)                   — All usages of a symbol" },
-    ToolSpec { canonical_name: "project_map",       aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "navigator"],                 group: None,                        prompt_category: "Code Intelligence", prompt_line: "- project_map(dir?, depth?)                          — Project layout summary" },
-    ToolSpec { canonical_name: "find_entrypoints",  aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &[],                                           group: None,                        prompt_category: "Code Intelligence", prompt_line: "- find_entrypoints(dir?, depth?, limit?)             — Find app/CLI/web/test entrypoints" },
-    ToolSpec { canonical_name: "trace_call_path",   aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator"],                               group: None,                        prompt_category: "Code Intelligence", prompt_line: "- trace_call_path(symbol, dir?, depth?)               — Caller chain for a symbol" },
+    ToolSpec { canonical_name: "project_map",       aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "navigator"],                                   group: None,                        prompt_category: "Code Intelligence", prompt_line: "- project_map(dir?, depth?)                          — Project layout summary" },
+    ToolSpec { canonical_name: "find_entrypoints",  aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator"],                                           group: None,                        prompt_category: "Code Intelligence", prompt_line: "- find_entrypoints(dir?, depth?, limit?)             — Find app/CLI/web/test entrypoints" },
+    ToolSpec { canonical_name: "trace_call_path",   aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["navigator"],                                           group: None,                        prompt_category: "Code Intelligence", prompt_line: "- trace_call_path(symbol, dir?, depth?)               — Caller chain for a symbol" },
 
     // ── Communication ────────────────────────────────────────────────────────
-    ToolSpec { canonical_name: "ask_human",         aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "research", "reviewer"],                  group: None,                        prompt_category: "Communication",     prompt_line: "- ask_human(question)                                — Ask for clarification or report a blocker" },
-    ToolSpec { canonical_name: "notify",            aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer", "qa"],                             group: None,                        prompt_category: "Communication",     prompt_line: "- notify(message, silent?)                           — Send a one-way progress notification" },
+    //
+    // ask_human: boss/research/reviewer can clarify requirements or report blockers.
+    //   developer and navigator added: they can surface unexpected blockers directly
+    //   without the 3-step boss detour (write memory → finish → boss reads → ask_human).
+    //
+    // notify: boss/developer/qa/research/reviewer can send progress notifications.
+    //   research added: long web research sessions should send heartbeat updates.
+    //   reviewer added: review can take many steps; user should see progress.
+    ToolSpec { canonical_name: "ask_human",         aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "research", "reviewer", "developer", "navigator"], group: None,                      prompt_category: "Communication",     prompt_line: "- ask_human(question, timeout_secs?)                 — Ask for clarification or report a blocker (timeout default: 120s)" },
+    ToolSpec { canonical_name: "notify",            aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer", "qa", "research", "reviewer"],     group: None,                        prompt_category: "Communication",     prompt_line: "- notify(message, silent?)                           — Send a one-way progress notification" },
 
     // ── Memory ───────────────────────────────────────────────────────────────
-    ToolSpec { canonical_name: "memory_read",       aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "research", "developer", "navigator", "qa", "reviewer", "memory"], group: None,                   prompt_category: "Memory",            prompt_line: "- memory_read(key)                                   — Read a memory entry" },
-    ToolSpec { canonical_name: "memory_write",      aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "research", "developer", "navigator", "qa", "reviewer", "memory"], group: None,                   prompt_category: "Memory",            prompt_line: "- memory_write(key, content, append?)                — Write or append a memory entry" },
-    ToolSpec { canonical_name: "memory_delete",     aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "memory"],                                      group: None,                   prompt_category: "Memory",            prompt_line: "- memory_delete(key)                                 — Delete a memory entry" },
+    ToolSpec { canonical_name: "memory_read",       aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "research", "developer", "navigator", "qa", "reviewer", "memory"], group: None, prompt_category: "Memory", prompt_line: "- memory_read(key)                                   — Read a memory entry" },
+    ToolSpec { canonical_name: "memory_write",      aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "research", "developer", "navigator", "qa", "reviewer", "memory"], group: None, prompt_category: "Memory", prompt_line: "- memory_write(key, content, append?)                — Write or append a memory entry" },
+    ToolSpec { canonical_name: "memory_delete",     aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "memory"],                                      group: None,                        prompt_category: "Memory",            prompt_line: "- memory_delete(key)                                 — Delete a stale memory entry" },
+    ToolSpec { canonical_name: "checkpoint",         aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer", "navigator", "qa", "reviewer", "research"], group: None, prompt_category: "Memory", prompt_line: "- checkpoint(note)                                  — Record mid-task progress without finishing" },
 
     // ── Orchestration ────────────────────────────────────────────────────────
     ToolSpec { canonical_name: "spawn_agent",       aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss"],                                                group: None,                        prompt_category: "Orchestration",     prompt_line: "- spawn_agent(role, task, memory_key?, max_steps?)   — Delegate a subtask to a sub-agent" },
-    ToolSpec { canonical_name: "spawn_agents",      aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss"],                                                group: None,                        prompt_category: "Orchestration",     prompt_line: "- spawn_agents(agents[], timeout_secs?)              — Delegate parallel subtasks" },
+    ToolSpec { canonical_name: "spawn_agents",      aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss"],                                                group: None,                        prompt_category: "Orchestration",     prompt_line: "- spawn_agents(agents[], timeout_secs?)              — Delegate multiple subtasks sequentially, one after another" },
 
     // ── Self-Improvement ─────────────────────────────────────────────────────
     ToolSpec { canonical_name: "tool_request",      aliases: &["self_improve"],       status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss"],                                                group: None,                        prompt_category: "Self-Improvement",  prompt_line: "- tool_request(name, description, motivation, priority?) — Record a missing capability" },
     ToolSpec { canonical_name: "capability_gap",    aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss"],                                                group: None,                        prompt_category: "Self-Improvement",  prompt_line: "- capability_gap(context, impact)                    — Report a structural blind spot" },
 
     // ── Browser (optional group: tool_groups = ["browser"]) ──────────────────
-    ToolSpec { canonical_name: "browser_action",    aliases: &["browser_automation"], status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer"],                                   group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- browser_action(action, selector, value?, wait_ms?) — Interact with a page element [experimental]" },
-    ToolSpec { canonical_name: "browser_get_text",  aliases: &[],                     status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer", "qa", "reviewer"],                 group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- browser_get_text(url, selector?, wait_ms?)         — Read rendered page content [experimental]" },
-    ToolSpec { canonical_name: "browser_navigate",  aliases: &[],                     status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer"],                                   group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- browser_navigate(url, wait_ms?)                    — Navigate and wait for load [experimental]" },
-    ToolSpec { canonical_name: "screenshot",        aliases: &[],                     status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer", "qa", "reviewer"],                 group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- screenshot(url, wait_ms?, full_page?)              — Take a screenshot [experimental]" },
+    //
+    // Browser workflow:
+    //   1. check_awp_server()                    — verify server is reachable first
+    //   2. browser_navigate(url, wait_ms?)        — navigate; returns SOM snapshot
+    //   3. browser_get_text(selector?, wait_ms?)  — extract text from page
+    //      OR browser_action(action, selector, ..., wait_ms?) — interact with element
+    //   4. screenshot()                           — AWP v0.1: saves SOM JSON (not PNG)
+    //
+    // wait_ms: milliseconds to wait after navigation/action for JS to settle.
+    //   Default: 500ms. Max: 10000ms. Set to 0 to skip waiting.
+    //
+    // hover/clear in browser_action are emulated: hover→click, clear→type("").
+    ToolSpec { canonical_name: "check_awp_server",  aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer"],                                   group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- check_awp_server()                                 — Check AWP server reachability; call this before any other browser tool" },
+    ToolSpec { canonical_name: "browser_action",    aliases: &["browser_automation"], status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer"],                                   group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- browser_action(action, url, ref?, css?, value?, wait_ms?) — Interact with element (click/type/scroll/select/hover/clear). url is REQUIRED every call (stateless session). Use css= for elements without ARIA role (e.g. div, td). [experimental]" },
+    ToolSpec { canonical_name: "browser_get_text",  aliases: &[],                     status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer", "qa", "reviewer"],                 group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- browser_get_text(url?, selector?, wait_ms?)        — Read rendered page text [experimental]" },
+    ToolSpec { canonical_name: "browser_navigate",  aliases: &[],                     status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer"],                                   group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- browser_navigate(url, wait_ms?)                    — Navigate and return SOM snapshot. file:// not supported — serve files via HTTP first. [experimental]" },
+    ToolSpec { canonical_name: "screenshot",        aliases: &[],                     status: ToolStatus::Experimental, dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer", "qa", "reviewer"],                 group: Some(ToolGroup::Browser),    prompt_category: "Browser",           prompt_line: "- screenshot(url?, wait_ms?, path?)                  — Save SOM snapshot (AWP v0.1: JSON, not PNG) [experimental]" },
 
     // ── Background Processes (optional group: tool_groups = ["background"]) ──
     ToolSpec { canonical_name: "run_background",    aliases: &[],                     status: ToolStatus::Real,         dispatch: ToolDispatchKind::Runtime,   allowed_roles: &["boss", "developer"],                                   group: Some(ToolGroup::Background), prompt_category: "Background",        prompt_line: "- run_background(id, program, args?, cwd?)           — Start a background process" },
@@ -372,14 +397,15 @@ mod tests {
 
     #[test]
     fn core_tool_counts_within_budget() {
-        // No optional groups enabled — verify core counts
+        // Budgets updated: developer+navigator+reviewer got ask_human (+1 each);
+        // research+reviewer got notify (+1 each).
         let budgets = [
-            ("boss", 13),
-            ("developer", 18),
-            ("navigator", 15), // navigator is read-only so 15 is acceptable
-            ("qa", 15),
-            ("reviewer", 12),
-            ("research", 8),
+            ("boss", 16),
+            ("developer", 25),
+            ("navigator", 20),
+            ("qa", 18),
+            ("reviewer", 16),
+            ("research", 11),
             ("memory", 4),
         ];
         for (role, max) in budgets {
@@ -408,71 +434,73 @@ mod tests {
         let dev_browser = allowed_tools_for_role_with_groups("developer", &groups_browser).len();
         let dev_all = allowed_tools_for_role_with_groups("developer", &groups_all).len();
 
-        assert!(
-            dev_browser > dev_core,
-            "browser group should add tools to developer"
-        );
+        assert!(dev_browser > dev_core, "browser group should add tools to developer");
         assert!(dev_all > dev_browser, "all groups should add more tools");
 
-        // browser group must not appear in navigator
         let nav_browser = allowed_tools_for_role_with_groups("navigator", &groups_browser);
-        assert!(
-            !nav_browser.contains(&"screenshot"),
-            "navigator should not get browser tools"
-        );
+        assert!(!nav_browser.contains(&"screenshot"), "navigator should not get browser tools");
     }
 
     #[test]
     fn developer_has_no_code_intelligence_tools() {
         let dev_tools = allowed_tools_for_role("developer");
-        let ci_tools = [
-            "get_symbols",
-            "outline",
-            "get_signature",
-            "find_references",
-            "trace_call_path",
-        ];
-        for tool in ci_tools {
-            assert!(
-                !dev_tools.contains(&tool),
-                "developer should not have code intelligence tool '{}' — use navigator sub-agent",
-                tool
-            );
+        for tool in ["get_symbols", "outline", "get_signature", "find_references", "trace_call_path"] {
+            assert!(!dev_tools.contains(&tool), "developer should not have '{tool}'");
         }
     }
 
     #[test]
     fn developer_has_no_fs_search_tools() {
         let dev_tools = allowed_tools_for_role("developer");
-        let search_tools = ["search_in_files", "find_files", "list_dir"];
-        for tool in search_tools {
-            assert!(
-                !dev_tools.contains(&tool),
-                "developer should not have fs-search tool '{}' — use navigator sub-agent",
-                tool
-            );
+        for tool in ["search_in_files", "find_files", "list_dir"] {
+            assert!(!dev_tools.contains(&tool), "developer should not have '{tool}'");
         }
     }
 
     #[test]
     fn boss_has_no_direct_code_tools() {
         let boss_tools = allowed_tools_for_role("boss");
-        let forbidden = [
-            "write_file",
-            "str_replace",
-            "run_command",
-            "read_file",
-            "get_symbols",
-            "outline",
-            "git_commit",
-        ];
-        for tool in forbidden {
-            assert!(
-                !boss_tools.contains(&tool),
-                "boss should not have direct code tool '{}' — delegate to sub-agents",
-                tool
-            );
+        for tool in ["write_file", "str_replace", "run_command", "read_file", "get_symbols", "outline", "git_commit"] {
+            assert!(!boss_tools.contains(&tool), "boss should not have '{tool}'");
         }
+    }
+
+    #[test]
+    fn ask_human_accessible_to_developer_and_navigator() {
+        // Regression guard: developer and navigator must be able to surface
+        // unexpected blockers directly without routing through Boss.
+        let dev_tools = allowed_tools_for_role("developer");
+        assert!(dev_tools.contains(&"ask_human"), "developer must have ask_human");
+        let nav_tools = allowed_tools_for_role("navigator");
+        assert!(nav_tools.contains(&"ask_human"), "navigator must have ask_human");
+    }
+
+    #[test]
+    fn notify_accessible_to_research_and_reviewer() {
+        // Regression guard: research and reviewer must be able to send heartbeats.
+        let research_tools = allowed_tools_for_role("research");
+        assert!(research_tools.contains(&"notify"), "research must have notify");
+        let reviewer_tools = allowed_tools_for_role("reviewer");
+        assert!(reviewer_tools.contains(&"notify"), "reviewer must have notify");
+    }
+
+    #[test]
+    fn git_stash_is_accessible_to_developer() {
+        let dev_tools = allowed_tools_for_role("developer");
+        assert!(dev_tools.contains(&"git_stash"), "developer must have git_stash");
+    }
+
+    #[test]
+    fn find_entrypoints_is_accessible_to_navigator() {
+        let nav_tools = allowed_tools_for_role("navigator");
+        assert!(nav_tools.contains(&"find_entrypoints"), "navigator must have find_entrypoints");
+    }
+
+    #[test]
+    fn developer_has_diff_repo_and_open_file_region() {
+        let dev_tools = allowed_tools_for_role("developer");
+        assert!(dev_tools.contains(&"diff_repo"), "developer must have diff_repo");
+        assert!(dev_tools.contains(&"open_file_region"), "developer must have open_file_region");
     }
 
     #[test]
@@ -490,14 +518,12 @@ mod tests {
         let rendered = render_tool_catalog_for_role_with_groups(Some("developer"), &groups);
         assert!(rendered.contains("screenshot("));
         assert!(rendered.contains("browser_navigate("));
-        // capability notes appear because browser tools are [experimental]
         assert!(rendered.contains("[experimental]"));
         assert!(rendered.contains("### Capability notes"));
     }
 
     #[test]
     fn renders_status_tags_and_capability_notes_with_groups() {
-        // real background tools should render without capability notes
         let groups = vec!["background".to_string()];
         let rendered = render_tool_catalog_for_role_with_groups(Some("developer"), &groups);
         assert!(rendered.contains("run_background("));
@@ -524,5 +550,15 @@ mod tests {
 ";
         let extracted = extract_tool_names_from_prompt(prompt);
         assert_eq!(extracted, vec!["read_file", "browser_action", "finish"]);
+    }
+
+    #[test]
+    fn checkpoint_accessible_to_workers_not_memory() {
+        for role in &["boss", "developer", "navigator", "qa", "reviewer", "research"] {
+            let tools = allowed_tools_for_role(role);
+            assert!(tools.contains(&"checkpoint"), "role '{role}' must have checkpoint");
+        }
+        let memory_tools = allowed_tools_for_role("memory");
+        assert!(!memory_tools.contains(&"checkpoint"), "memory role must not have checkpoint");
     }
 }

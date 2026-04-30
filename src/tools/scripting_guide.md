@@ -3,7 +3,7 @@
 `run_script` executes a sandboxed [Rhai](https://rhai.rs) script inside the
 agent process.  It is **not** a shell — it cannot launch programs, touch the
 network, or escape the repository root.  It is a fast, safe computation layer
-that runs in **≤ 1 second**.
+that runs in **≤ 30 seconds**.
 
 ---
 
@@ -19,8 +19,9 @@ would otherwise require many read → think → write cycles.
 | Validate that every item in a list satisfies a rule | multiple reads + mental checks | loop + `log` + return bool |
 | Generate a repetitive block (e.g. 20 match arms) | write_file with manual text | script builds the string |
 | Check a regex against extracted text | read_file → mental match | `regex_match` |
-| Compute a checksum / hash / length of a string | impossible without shell | `sha256`, `len` |
+| Compute a hash for change detection / deduplication | impossible without shell | `fnv64` |
 | Summarise a CSV: count rows, check headers | read_file → mental parse | `read_lines` + loop |
+| Generate and write a file from template/data | write_file with manual construction | `write_text` + loop (allow_write: true) |
 
 **Do NOT use run_script for:**
 - Running build tools, tests, linters → use `run_command`
@@ -37,14 +38,21 @@ would otherwise require many read → think → write cycles.
 let lines = read_lines("src/lib.rs");   // → Array of strings, one per line
 let text  = read_text("data.csv");      // → full file as one string
 
+// Directory inspection (sandboxed to repo root)
+let entries = list_dir("src");          // → Array of entry names (sorted), e.g. ["agent", "lib.rs"]
+let exists  = file_exists("Cargo.toml"); // → bool
+
+// File write (only when allow_write: true is passed to run_script)
+write_text("out/report.txt", result);  // → creates parent dirs, returns "written: ..."
+
 // Pattern matching
 regex_match("^v\\d+\\.\\d+", version)  // → bool
 
 // Data
 let obj = parse_json(text);             // → Map/Array/scalar from JSON string
 
-// Crypto / hashing
-let h = sha256("hello");                // → hex string
+// Hashing (non-cryptographic — change detection / deduplication only)
+let h = fnv64("hello");              // → FNV-1a 64-bit hash as 16-char hex string
 
 // Logging (shown in tool output under "Logs:")
 log("checked " + count.to_string() + " entries");
@@ -93,13 +101,24 @@ log("data rows: " + rows.to_string());
 rows
 ```
 
+### Generate a file from a template (allow_write: true)
+```rhai
+let variants = ["Ollama", "OpenAI", "Anthropic"];
+let mut body = "pub enum Backend {\n";
+for v in variants {
+    body += "    " + v + ",\n";
+}
+body += "}\n";
+write_text("src/backend_gen.rs", body)
+```
+
 ---
 
 ## Limits (sandbox)
 
 | Limit | Value |
 |---|---|
-| Wall-clock timeout | 1 second |
+| Wall-clock timeout | 30 seconds |
 | Operations | 200 000 |
 | Array size | 10 000 items |
 | String size | 64 KB |

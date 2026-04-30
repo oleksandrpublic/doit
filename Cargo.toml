@@ -1,6 +1,6 @@
 [package]
 name        = "do_it"
-version     = "0.3.2"
+version     = "0.3.3"
 edition     = "2021"
 authors     = [
     "Claude Sonnet 4.6 <claude@anthropic.com>",
@@ -23,6 +23,9 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+
+# Cancellation tokens for background tasks
+tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP — Ollama API, web_search, fetch_url, Telegram
 reqwest = { version = "0.13", features = ["json"] }
@@ -63,9 +66,6 @@ lazy_static = "1.5"
 # Date/time handling
 chrono = "0.4"
 
-# Browser automation via Chrome DevTools Protocol
-headless_chrome = "1.0"
-
 # URL parsing and validation
 url = "2"
 
@@ -75,13 +75,20 @@ urlencoding = "2"
 # Percent encoding (fetch_url file:// handling)
 percent-encoding = "2"
 
+# HTML parsing (web_search result extraction)
+scraper = "0.23"
+
 # Embedded scripting
-rhai = "1.23.6"
+rhai = "1.24"
 regex = "1"
 
 # Terminal UI
 ratatui   = "0.30"
 crossterm = "0.29"
+
+# AWP browser client (WebSocket)
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 filetime = "0.2"

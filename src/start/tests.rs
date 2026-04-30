@@ -1,4 +1,5 @@
 use super::run_support::{format_config_output, load_run_config, resolve_run_task_input};
+use super::check::{CheckItem, collect_ai_structure_issues, format_check_report};
 use super::status::{
     StatusEmptyState, collect_knowledge_keys, collect_session_artifacts,
     format_session_artifact_summary, format_status_artifact_sections, format_status_body,
@@ -595,4 +596,136 @@ fn format_status_header_renders_session_and_config_counters() {
             temp.path().join("config.toml").display()
         )
     }));
+}
+
+#[test]
+fn collect_ai_structure_issues_reports_missing_workspace() {
+    let temp = tempfile::TempDir::new().unwrap();
+
+    let issues = collect_ai_structure_issues(temp.path());
+
+    assert_eq!(issues, vec!["missing .ai/".to_string()]);
+}
+
+#[test]
+fn collect_ai_structure_issues_accepts_complete_workspace() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let ai = temp.path().join(".ai");
+    for subdir in ["state", "logs", "knowledge", "prompts", "tools", "screenshots"] {
+        std::fs::create_dir_all(ai.join(subdir)).unwrap();
+    }
+    std::fs::write(ai.join("project.toml"), "[project]\nname = \"demo\"\n").unwrap();
+
+    let issues = collect_ai_structure_issues(temp.path());
+
+    assert!(issues.is_empty(), "unexpected issues: {issues:?}");
+}
+
+#[test]
+fn format_check_report_renders_pass_and_fail_lines() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let report = format_check_report(
+        temp.path(),
+        &[
+            CheckItem::ok("config load", "repo: demo/config.toml"),
+            CheckItem::fail(".ai structure", "missing .ai/project.toml"),
+        ],
+    );
+
+    assert!(report.contains("do_it check"));
+    assert!(report.contains("[ok  ] config load"));
+    assert!(report.contains("[fail] .ai structure"));
+    assert!(report.contains("Summary: FAIL"));
+}
+
+#[test]
+fn format_check_report_renders_warn_and_pass_with_warnings() {
+    use super::check::CheckItem;
+    let temp = tempfile::TempDir::new().unwrap();
+    let report = format_check_report(
+        temp.path(),
+        &[
+            CheckItem::ok("config load", "repo: demo/config.toml"),
+            CheckItem::warn("runtime validate", "model reachability not probed"),
+        ],
+    );
+
+    assert!(report.contains("[ok  ] config load"));
+    assert!(report.contains("[warn] runtime validate"));
+    assert!(report.contains("Summary: PASS (with warnings)"));
+    assert!(report.contains("[warn] items do not block"));
+    // Must NOT contain FAIL
+    assert!(!report.contains("Summary: FAIL"));
+}
+
+// ─── check.rs browser group ──────────────────────────────────────────────────────
+//
+// These tests exercise the AWP-specific validation logic in the `"browser"`
+// match arm of `cmd_check` by calling `format_check_report` with synthetic
+// CheckItems that mirror what the real branch produces. The branch itself is
+// tested at the unit level here; an end-to-end async test would require a
+// live AWP server.
+
+#[test]
+fn check_browser_group_ok_for_valid_awp_http_url() {
+    let temp = tempfile::TempDir::new().unwrap();
+
+    // Simulate the [ok] item produced when awp_url is a valid http:// URL.
+    let report = format_check_report(
+        temp.path(),
+        &[
+            CheckItem::ok(
+                "tool_group: browser (awp)",
+                "awp_url = http://127.0.0.1:9222 (reachability not probed at check time)",
+            ),
+        ],
+    );
+
+    assert!(report.contains("[ok  ] tool_group: browser (awp)"));
+    assert!(report.contains("awp_url = http://127.0.0.1:9222"));
+    assert!(report.contains("Summary: PASS"));
+    assert!(!report.contains("Summary: FAIL"));
+}
+
+#[test]
+fn check_browser_group_fail_for_ws_scheme_url() {
+    let temp = tempfile::TempDir::new().unwrap();
+
+    // Simulate the [fail] item produced when awp_url still has a legacy ws:// scheme.
+    let report = format_check_report(
+        temp.path(),
+        &[
+            CheckItem::fail(
+                "tool_group: browser (awp)",
+                "awp_url 'ws://127.0.0.1:9222' must start with http:// or https://",
+            ),
+        ],
+    );
+
+    assert!(report.contains("[fail] tool_group: browser (awp)"));
+    assert!(report.contains("must start with http://"));
+    assert!(report.contains("Summary: FAIL"));
+}
+
+#[test]
+fn check_browser_group_warn_when_awp_url_not_set() {
+    let temp = tempfile::TempDir::new().unwrap();
+
+    // Simulate the [warn] item produced when awp_url is absent from config.
+    let report = format_check_report(
+        temp.path(),
+        &[
+            CheckItem::warn(
+                "tool_group: browser",
+                "awp_url is not set in [browser]; browser tools will fail at runtime. \
+                 Start the server with: plasmate serve --protocol awp --host 127.0.0.1 --port 9222",
+            ),
+        ],
+    );
+
+    assert!(report.contains("[warn] tool_group: browser"));
+    assert!(report.contains("awp_url is not set"));
+    assert!(report.contains("plasmate serve --protocol awp"));
+    assert!(report.contains("Summary: PASS (with warnings)"));
+    assert!(!report.contains("Summary: FAIL"));
 }
